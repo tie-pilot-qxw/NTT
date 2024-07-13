@@ -3,10 +3,13 @@
 #include <cassert>
 #include <cuda_runtime.h>
 #include <ctime>
+#include <gmp.h>
 #include "cgbn/cgbn.h"
 
 #define P (4179340454199820289) // 29 * 2^57 + 1ll
 #define root (3)
+#define TPI 8
+#define BITS 64
 
 inline long long qpow(long long x, long long y) {
     long long base = 1ll;
@@ -48,38 +51,57 @@ void NTT(long long data[], long long reverse[], long long len, long long omega) 
     }
 }
 
-template <uint tpi, uint bits>
+template <const uint tpi, const uint bits>
 __global__ void rearrange(cgbn_mem_t<bits> * data, long long * reverse, long long len) {
-    typedef cgbn_context_t<tpi> context_t;
-    typedef cgbn_env_t<context_t, bits> env_t;
-
     long long index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= len) return;
     long long rid = reverse[index];
     if (index < rid) {
-        context_t bn_context();
-        env_t bn_env(bn_context);
-        long long tmp = data[index];
+        cgbn_mem_t<bits> tmp = data[index];
         data[index] = data[rid];
         data[rid] = tmp;
     }
 }
 
-__global__ void naive(long long data[], long long len, long long roots[], long long stride) {
+template <const uint tpi, const uint bits>
+__global__ void naive(cgbn_mem_t<bits> data[], long long len, cgbn_mem_t<bits> roots[], long long stride, cgbn_mem_t<bits> prime) {
+    typedef cgbn_context_t<tpi> context_t;
+    typedef cgbn_env_t<context_t, bits> env_t;
 
-    long long id = blockDim.x * blockIdx.x + threadIdx.x;
+    context_t bn_context();
+    env_t bn_env(bn_context);
+
+    long long id = ((long long)blockDim.x * blockIdx.x + threadIdx.x) / tpi;
     if (id << 1 >= len) return;
     long long offset = id % stride;
     long long pos = ((id - offset) << 1ll) + offset;
 
-    long long w = roots[offset * len / (stride << 1ll)];
+    typename env_t::cgbn_t  a, b, w, ra, rb, mod;
+    typename env_t::cgbn_wide_t wtmp;
 
-    long long a = data[pos], b = w * data[pos + stride] % P;
-    data[pos] = (a + b) % P;
-    data[pos + stride] = (a - b + P) % P;
+    cgbn_load(bn_env, mod, &prime);
+    cgbn_load(bn_env, a, &data[pos]);
+    cgbn_load(bn_env, b, &data[pos + stride]);
+    cgbn_load(bn_env, w, &roots[offset * len / (stride << 1ll)]);
+
+    // b = w * data[pos + stride] % P
+    cgbn_mul_wide(bn_env, wtmp, w, b);
+    cgbn_rem_wide(bn_env, b, wtmp, mod);
+
+    // data[pos] = (a + b) % P
+    cgbn_add(bn_env, ra, a, b);
+    cgbn_rem(bn_env, ra, ra, mod);
+    cgbn_store(bn_env, &data[pos], ra);
+
+    // data[pos + stride] = (a - b + P) % P
+    cgbn_add(bn_env, rb, a, mod);
+    cgbn_sub(bn_env, rb, rb, b);
+    cgbn_rem(bn_env, rb, rb, mod);
+    cgbn_store(bn_env, &data[pos + stride], rb);
 }
 
-void NTT_GPU_Naive(long long data[], long long reverse[], long long len, long long omega) {
+template <const uint tpi, const uint bits>
+void NTT_GPU_Naive(cgbn_mem_t<bits> data[], long long reverse[], long long len, cgbn_mem_t<bits> omega) {
     cudaEvent_t start, end;
     cudaEventCreate(&start);
     cudaEventCreate(&end);
@@ -101,7 +123,7 @@ void NTT_GPU_Naive(long long data[], long long reverse[], long long len, long lo
     dim3 block(768);
     dim3 grid((len - 1) / block.x + 1);
     dim3 grid1((len / 2 - 1) / block.x + 1);
-    rearrange <<< grid, block >>>(data, reverse, len);
+    rearrange<tpi, bits> <<< grid, block >>>(data, reverse, len);
     for (long long stride = 1ll; stride < len; stride <<= 1ll) {
         naive <<< grid1, block >>>(data, len, roots_d, stride);
     }
@@ -216,11 +238,11 @@ void NTT_GZKP(long long data[], long long reverse[], long long len, long long om
     dim3 grid0((len - 1) / block.x + 1);
     dim3 grid1((len / 2 - 1) / block.x + 1);
 
-    rearrange <<< grid0, block >>>(data, reverse, len);
+    //rearrange <<< grid0, block >>>(data, reverse, len);
 
     long long stride = 1ll;
     for (; stride < G; stride <<= 1) {
-        naive <<< grid1, block >>>(data, len, roots_d, stride);
+        //naive <<< grid1, block >>>(data, len, roots_d, stride);
     }
 
     for (; stride << B <= len; stride <<= B) {
@@ -302,7 +324,7 @@ int main() {
     cudaMemcpy(reverse_d, reverse, length * sizeof(*reverse_d), cudaMemcpyHostToDevice);
 
     // naive gpu approach
-    NTT_GPU_Naive(data_d, reverse_d, length, root);
+    // NTT_GPU_Naive(data_d, reverse_d, length, root);
 
     long long *tmp;
     tmp = new long long [length];

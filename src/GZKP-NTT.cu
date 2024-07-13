@@ -48,15 +48,13 @@ void NTT(long long data[], long long reverse[], long long len, long long omega) 
     }
 }
 
-__global__ void rearrange(long long * data, long long * reverse, long long len) {
+__global__ void rearrange(long long * data, longlong2 * reverse, long long len) {
     long long index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= len) return;
-    long long rid = reverse[index];
-    if (index < rid) {
-        long long tmp = data[index];
-        data[index] = data[rid];
-        data[rid] = tmp;
-    }
+    longlong2 r = reverse[index];
+    long long tmp = data[r.x];
+    data[r.x] = data[r.y];
+    data[r.y] = tmp;
 }
 
 __global__ void naive(long long data[], long long len, long long roots[], long long stride) {
@@ -73,7 +71,7 @@ __global__ void naive(long long data[], long long len, long long roots[], long l
     data[pos + stride] = (a - b + P) % P;
 }
 
-void NTT_GPU_Naive(long long data[], long long reverse[], long long len, long long omega) {
+void NTT_GPU_Naive(long long data[], longlong2 reverse[], long long len, long long omega, long long reverse_num) {
     cudaEvent_t start, end;
     cudaEventCreate(&start);
     cudaEventCreate(&end);
@@ -93,17 +91,11 @@ void NTT_GPU_Naive(long long data[], long long reverse[], long long len, long lo
     tmp = new long long [len];
 
     dim3 block(768);
-    dim3 grid((len - 1) / block.x + 1);
+    dim3 grid((reverse_num - 1) / block.x + 1);
     dim3 grid1((len / 2 - 1) / block.x + 1);
-    rearrange <<< grid, block >>>(data, reverse, len);
+    rearrange <<< grid, block >>>(data, reverse, reverse_num);
     for (long long stride = 1ll; stride < len; stride <<= 1ll) {
         naive <<< grid1, block >>>(data, len, roots_d, stride);
-
-        // cudaMemcpy(tmp, data, sizeof(*data) * len, cudaMemcpyDeviceToHost);
-        // for (long long i = 0; i < len; i++) {
-        //     printf("%lld ", tmp[i]);
-        // }
-        // printf("\n");
     }
     cudaEventRecord(end);
     cudaEventSynchronize(end);
@@ -184,7 +176,7 @@ __global__ void GZKP (long long data[],  long long len, long long roots[], long 
     data[gpos + stride] = s[spos + 1];
 }
 
-void NTT_GZKP(long long data[], long long reverse[], long long len, long long omega, int B, int G) {
+void NTT_GZKP(long long data[], longlong2 reverse[], long long len, long long omega, int B, int G, long long reverse_num) {
     cudaEvent_t start, end;
     cudaEventCreate(&start);
     cudaEventCreate(&end);
@@ -213,10 +205,11 @@ void NTT_GZKP(long long data[], long long reverse[], long long len, long long om
     long long *tmp;
     tmp = new long long [len];
 
-    dim3 grid0((len - 1) / block.x + 1);
+    dim3 block0(768);
+    dim3 grid0((reverse_num - 1) / block0.x + 1);
     dim3 grid1((len / 2 - 1) / block.x + 1);
 
-    rearrange <<< grid0, block >>>(data, reverse, len);
+    rearrange <<< grid0, block0 >>>(data, reverse, reverse_num);
 
     long long stride = 1ll;
     for (; stride < G; stride <<= 1) {
@@ -294,15 +287,26 @@ int main() {
         printf("cpu: %lfms\n",(double)(end - start) / CLOCKS_PER_SEC * 1000);
     }
 
-    long long *data_d, *reverse_d;
+    // revise the reverse array to elimate branch divergence
+    longlong2 *reverse2 = (longlong2 *)malloc(length / 2 * sizeof(longlong2));
+    long long reverse_num =  0;
+    
+    for (long long i = 0; i < length; i++) {
+        if (reverse[i] < i) {
+            reverse2[reverse_num] = make_longlong2(reverse[i], i);
+            reverse_num++;
+        }
+    }
+    longlong2 *reverse2_d;
+    long long *data_d;
 
     cudaMalloc(&data_d, length * sizeof(*data_d));
-    cudaMalloc(&reverse_d, length * sizeof(*reverse_d));
+    cudaMalloc(&reverse2_d, length / 2 * sizeof(*reverse2_d));
     cudaMemcpy(data_d, data_copy, length * sizeof(*data_d), cudaMemcpyHostToDevice);
-    cudaMemcpy(reverse_d, reverse, length * sizeof(*reverse_d), cudaMemcpyHostToDevice);
+    cudaMemcpy(reverse2_d, reverse2, length / 2 * sizeof(*reverse2), cudaMemcpyHostToDevice);
 
     // naive gpu approach
-    NTT_GPU_Naive(data_d, reverse_d, length, root);
+    NTT_GPU_Naive(data_d, reverse2_d, length, root, reverse_num);
 
     long long *tmp;
     tmp = new long long [length];
@@ -320,7 +324,7 @@ int main() {
 
     cudaMemcpy(data_d, data_copy, length * sizeof(*data_d), cudaMemcpyHostToDevice);
 
-    NTT_GZKP(data_d, reverse_d, length, root, 6, 8);
+    NTT_GZKP(data_d, reverse2_d, length, root, 6, 8, reverse_num);
 
     cudaMemcpy(tmp, data_d, sizeof(*data_d) * length, cudaMemcpyDeviceToHost);
 
@@ -340,11 +344,13 @@ int main() {
     //     }
     // }
     cudaFree(data_d);
-    cudaFree(reverse_d);
+    cudaFree(reverse2_d);
 
     delete [] data;
     delete [] data_copy;
     delete [] reverse;
     delete [] tmp;
+    free(reverse2);
+
     return 0;
 }
