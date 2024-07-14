@@ -112,64 +112,88 @@ void NTT_GPU_Naive(long long data[], longlong2 reverse[], long long len, long lo
 
 __global__ void GZKP (long long data[],  long long len, long long roots[], long long stride, int G, int csize, int B) {
     extern __shared__ long long s[];
-    long long *global = s + csize * 2 * G;
-
+    int load_part_sz = csize * G;
+    long long *w_s = s + (load_part_sz << 1);
+    
     long long start = (G * blockIdx.x) % stride + ((long long) G * blockIdx.x / stride) * stride * csize * 2;
 
-    int iogroup = threadIdx.x / G; // io group
-    int ioid = threadIdx.x % G; // id in the io group
-
+    int iogroup, ioid;
+    
     int spos; // load to
     long long gpos; // load from
-    long long gpos_c; // the global position of the computing element
+    int cid, base;
 
-    // (stride >= G) 
-    spos = ioid * csize * 2 + 2 * iogroup;
-    gpos = start + ioid + iogroup * 2 * stride;
+    // half of the threads load the data, the other half load the roots
 
-    // load to shared memory
-    if (gpos + stride >= len) return;
+    if (load_part_sz > threadIdx.x) {
+        iogroup = threadIdx.x / G;
+        ioid = threadIdx.x - iogroup * G;
+        
+        spos = ioid * csize * 2 + 2 * iogroup;
+        gpos = start + ioid + iogroup * 2 * stride;
 
-    // printf("%d %lld %lld\n",spos, gpos, start);
+        s[spos] = data[gpos];
+        s[spos + 1] = data[gpos + stride];
 
-    s[spos] = data[gpos];
-    global[spos] = gpos;
-    s[spos + 1] = data[gpos + stride];
-    global[spos + 1] = gpos + stride;
+        cid = threadIdx.x % csize; // id in the compute group
+        base =  (threadIdx.x - cid); // base pos / 2 of the compute group(need to * 2 to use)
+    } else {
+        iogroup = (threadIdx.x - load_part_sz) / G;
+        ioid = (threadIdx.x - load_part_sz) - iogroup * G;
 
-    // if (threadIdx.x == 0 && blockIdx.x == 0){
-    //     for (int i = 0; i < blockDim.x*2; i++) {
-    //         printf("%lld ", s[i]);
-    //     }
-    //     printf("\n");
-    // }
+        spos = ioid * csize * 2 + 2 * iogroup;
+        gpos = start + ioid + iogroup * 2 * stride;
 
+        w_s[spos / 2] = roots[(gpos % (stride * 2)) * len / (stride * 2)];
 
-    int cid = threadIdx.x % csize; // id of the compute group
-    int base =  (threadIdx.x - cid) << 1; // base pos of the compute group
+        cid = (threadIdx.x - load_part_sz) % csize;
+        base = (threadIdx.x - load_part_sz - cid);
+    }
+
     
     for (int i = 1, step = 1; i <= B && stride * step < len; i++, step *= 2) {
         __syncthreads();
+        // if (threadIdx.x == 1) {
+        //     for (int i = 0; i < load_part_sz * 2; i ++) {
+        //         printf("%lld ", w_s[i]);
+        //     }
+        //     printf("\n");
+        // }
+        if (threadIdx.x < load_part_sz) {
+            int offset = step * 2 * ((int)(cid / step)) + cid % step;
+            int pos = offset + (base << 1);
 
-        int offset = step * 2 * ((int)(cid / step)) + cid % step;
+            long long w = w_s[(base + cid) + ((i + 1) & 1) * load_part_sz];
 
-        gpos_c = global[base + offset];
+            long long a = s[pos],b = w * s[pos + step] % P;
+            s[pos] = (a + b) % P;
+            s[pos + step] = (a - b + P) % P;
+        } else {
+            int nstep = step << 1;
+            if (i < B && stride * nstep < len) {
+                int offset = nstep * 2 * ((int)(cid / nstep)) + cid % nstep;
+                int io_thread_id = (threadIdx.x - load_part_sz) / csize + offset / 2 * G;
 
-        long long tmp = gpos_c % (stride * step * 2) * len / (stride * step * 2);
+                iogroup = (io_thread_id) / G;
+                ioid = (io_thread_id) - iogroup * G;
 
-        long long w = roots[tmp];
+                long long tmp = start + ioid + iogroup * 2 * stride + (offset & 1) * stride;
 
-        long long a = s[base + offset], b = w * s[base + offset + step] % P;
-        s[base + offset] = (a + b) % P;
-        s[base + offset + step] = (a - b + P) % P;
+                w_s[(base + cid) + (i & 1) * load_part_sz] = roots[tmp % (stride * nstep * 2) * len / (stride * nstep * 2)];
+                
+                //printf("%d %lld %d %d\n", io_thread_id, tmp, iogroup, ioid);
+            }
+        }
 
         // printf("%d %d %lld %lld %lld %lld\n", base, offset, s[base + offset], s[base + offset + step], tmp, gpos_c);
-
     }
     
     __syncthreads();
-    data[gpos] = s[spos];
-    data[gpos + stride] = s[spos + 1];
+
+    if (threadIdx.x < load_part_sz) {
+        data[gpos] = s[spos];
+        data[gpos + stride] = s[spos + 1];
+    }
 }
 
 void NTT_GZKP(long long data[], longlong2 reverse[], long long len, long long omega, int B, int G, long long reverse_num) {
@@ -177,7 +201,7 @@ void NTT_GZKP(long long data[], longlong2 reverse[], long long len, long long om
     cudaEventCreate(&start);
     cudaEventCreate(&end);
 
-    dim3 block(qpow(2,B)*G/2);
+    dim3 block(qpow(2,B)*G);
     assert(block.x <= 1024);
 
     int dev = 0;
@@ -197,19 +221,15 @@ void NTT_GZKP(long long data[], longlong2 reverse[], long long len, long long om
     cudaMalloc(&roots_d, len * sizeof(*roots_d));
     cudaMemcpy(roots_d, roots, len * sizeof(*roots_d), cudaMemcpyHostToDevice);
 
-
-    long long *tmp;
-    tmp = new long long [len];
-
     dim3 block0(768);
     dim3 grid0((reverse_num - 1) / block0.x + 1);
-    dim3 grid1((len / 2 - 1) / block.x + 1);
+    dim3 grid1((len - 1) / block.x + 1);
 
     rearrange <<< grid0, block0 >>>(data, reverse, reverse_num);
 
     long long stride = 1ll;
     for (; stride < G; stride <<= 1) {
-        naive <<< grid1, block >>>(data, len, roots_d, stride);
+        naive <<< grid1, block0 >>>(data, len, roots_d, stride);
     }
 
     for (; stride << B <= len; stride <<= B) {
@@ -223,8 +243,8 @@ void NTT_GZKP(long long data[], longlong2 reverse[], long long len, long long om
         B++;
     }
     if (B != 0) {
-        block = dim3(qpow(2,B)*G/2);
-        grid1 = dim3((len / 2 - 1) / block.x + 1);
+        block = dim3(qpow(2,B)*G);
+        grid1 = dim3((len - 1) / block.x + 1);
         GZKP <<< grid1, block, sizeof(long long) * qpow(2,B) * G * 2>>>(data, len, roots_d, stride, G, qpow(2,B)/2, B);
     }
 
@@ -238,8 +258,6 @@ void NTT_GZKP(long long data[], longlong2 reverse[], long long len, long long om
 
     cudaFree(roots_d);
     delete [] roots;
-
-    delete [] tmp;
 }
 
 int main() {
@@ -248,7 +266,7 @@ int main() {
     int bits = 0;
 
     //scanf("%lld", &l);
-    l = 60000000;
+    l = qpow(2,24);
 
     while (length < l) {
         length <<= 1ll;
@@ -320,7 +338,7 @@ int main() {
 
     cudaMemcpy(data_d, data_copy, length * sizeof(*data_d), cudaMemcpyHostToDevice);
 
-    NTT_GZKP(data_d, reverse2_d, length, root, 6, 32, reverse_num);
+    NTT_GZKP(data_d, reverse2_d, length, root, 5, 32, reverse_num);
 
     cudaMemcpy(tmp, data_d, sizeof(*data_d) * length, cudaMemcpyDeviceToHost);
 
