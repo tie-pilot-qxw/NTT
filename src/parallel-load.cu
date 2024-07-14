@@ -333,7 +333,7 @@ int main() {
 
     cudaMemcpy(data_d, data_copy, length * sizeof(*data_d), cudaMemcpyHostToDevice);
 
-    NTT_GZKP(data_d, reverse2_d, length, root, 5, 32, reverse_num);
+    NTT_GZKP(data_d, reverse2_d, length, root, 7, 8, reverse_num);
 
     cudaMemcpy(tmp, data_d, sizeof(*data_d) * length, cudaMemcpyDeviceToHost);
 
