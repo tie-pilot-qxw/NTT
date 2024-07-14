@@ -153,12 +153,7 @@ __global__ void GZKP (long long data[],  long long len, long long roots[], long 
     
     for (int i = 1, step = 1; i <= B && stride * step < len; i++, step *= 2) {
         __syncthreads();
-        // if (threadIdx.x == 1) {
-        //     for (int i = 0; i < load_part_sz * 2; i ++) {
-        //         printf("%lld ", w_s[i]);
-        //     }
-        //     printf("\n");
-        // }
+
         if (threadIdx.x < load_part_sz) {
             int offset = step * 2 * ((int)(cid / step)) + cid % step;
             int pos = offset + (base << 1);
