@@ -198,12 +198,8 @@ void NTT_GZKP(long long data[], longlong2 reverse[], long long len, long long om
     rearrange <<< grid0, block0 >>>(data, reverse, reverse_num);
 
     long long stride = 1ll;
-    int G_t = 1, B_t = 0;
-    while (stride < G) stride <<= 1, B_t ++;
-    if (B_t > 0) {
-        dim3 block_t(qpow(2,B_t)*G_t/2);
-        dim3 grid_t((len / 2 - 1) / block_t.x + 1);
-        GZKP <<< grid_t, block_t, sizeof(long long) * qpow(2,B_t) * G_t>>>(data, len, roots_d, 1, G_t, qpow(2,B_t)/2, B_t);
+    for (; stride < G; stride <<= 1) {
+        naive <<< grid1, block >>>(data, len, roots_d, stride);
     }
 
     for (; stride << B <= len; stride <<= B) {
