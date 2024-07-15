@@ -3,7 +3,6 @@
 #include <cassert>
 #include <cuda_runtime.h>
 #include <ctime>
-#include "cgbn/cgbn.h"
 
 #define P (4179340454199820289) // 29 * 2^57 + 1ll
 #define root (3)
