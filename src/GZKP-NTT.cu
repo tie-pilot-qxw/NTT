@@ -4,7 +4,7 @@
 #include <cuda_runtime.h>
 #include <ctime>
 
-#define P (4179340454199820289) // 29 * 2^57 + 1ll
+#define P (998244353 ) // 29 * 2^57 + 1ll
 #define root (3)
 
 inline long long qpow(long long x, long long y) {
@@ -81,6 +81,7 @@ void NTT_GPU_Naive(long long data[], longlong2 reverse[], long long len, long lo
     roots = new long long [len];
     long long gap = qpow(omega, (P - 1ll) / len);
     roots[0] = 1;
+    printf("%lld\n", gap);
     for (long long i = 1; i < len; i++) roots[i] = roots[i - 1] * gap % P;
     
     cudaMalloc(&roots_d, len * sizeof(*roots_d));
@@ -237,7 +238,7 @@ int main() {
     int bits = 0;
 
     //scanf("%lld", &l);
-    l = qpow(2, 24);
+    l = 16;//qpow(2, 24);
 
     while (length < l) {
         length <<= 1ll;
