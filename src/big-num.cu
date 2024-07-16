@@ -170,7 +170,7 @@ __global__ void GZKP (cgbn_mem_t<bits> data[],  uint len, cgbn_mem_t<bits> roots
     typedef cgbn_context_t<tpi> context_t;
     typedef cgbn_env_t<context_t, bits> env_t;
 
-    extern __shared__ typename env_t::cgbn s[];
+    extern __shared__ cgbn_mem_t<bits> s[];
 
     context_t bn_context;
     env_t bn_env(bn_context);
@@ -192,24 +192,20 @@ __global__ void GZKP (cgbn_mem_t<bits> data[],  uint len, cgbn_mem_t<bits> roots
     // load to shared memory
     if (gpos + stride >= len) return;
 
-    cgbn_load(bn_env, s[spos], &data[gpos]);
-    cgbn_load(bn_env, s[spos + 1], &data[gpos + stride]);
+    uint num_part = threadIdx.x & (tpi - 1);
+
+    if (num_part < bits / 32) {
+        s[spos]._limbs[num_part] = data[gpos]._limbs[num_part];
+        s[spos + 1]._limbs[num_part] = data[gpos + stride]._limbs[num_part];
+    }
     
     uint cid = id % csize; // id of the compute group
     uint base =  (id - cid) << 1; // base pos of the compute group
 
-    typename env_t::cgbn_t w, a, b, mod;
+    typename env_t::cgbn_t x, y, w, a, b, mod;
     typename env_t::cgbn_wide_t wtmp;
     cgbn_load(bn_env, mod, &prime);
 
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        for (int i  = 0; i < blockDim.x / tpi * 2; i++) {
-            printf("%d ", s[i]._limbs[0]);
-        }
-        printf("\n");
-    }
-    
     for (uint i = 1, step = 1; i <= B && stride * step < len; i++, step *= 2) {
         __syncthreads();
 
@@ -225,32 +221,34 @@ __global__ void GZKP (cgbn_mem_t<bits> data[],  uint len, cgbn_mem_t<bits> roots
         tmp = tmp * (len / (stride * step * 2));
 
         cgbn_load(bn_env, w, &roots[tmp]);
+        cgbn_load(bn_env, x, &s[base + offset]);
+        cgbn_load(bn_env, y, &s[base + offset + step]);
 
         // a = s[base + offset]
-        cgbn_set(bn_env, a, s[base + offset]);
+        cgbn_set(bn_env, a, x);
         // b = w * s[base + offset + step] % P
-        cgbn_mul_wide(bn_env, wtmp, w, s[base + offset + step]);
+        cgbn_mul_wide(bn_env, wtmp, w, y);
         cgbn_rem_wide(bn_env, b, wtmp, mod);
 
         // s[base + offset] = (a + b) % P;
-        cgbn_add(bn_env, s[base + offset], a, b);
-        cgbn_rem(bn_env, s[base + offset], s[base + offset], mod);
+        cgbn_add(bn_env, x, a, b);
+        cgbn_rem(bn_env, x, x, mod);
 
         // s[base + offset + step] = (a - b + P) % P;
-        cgbn_add(bn_env, s[base + offset + step], a, mod);
-        cgbn_sub(bn_env, s[base + offset + step], s[base + offset + step], b);
-        cgbn_rem(bn_env, s[base + offset + step], s[base + offset + step], mod);
+        cgbn_add(bn_env, y, a, mod);
+        cgbn_sub(bn_env, y, y, b);
+        cgbn_rem(bn_env, y, y, mod);
+
+        cgbn_store(bn_env, &s[base + offset], x);
+        cgbn_store(bn_env, &s[base + offset + step], y);
     }
     
     __syncthreads();
-    if (threadIdx.x == 0) {
-        for (int i  = 0; i < blockDim.x / tpi * 2; i++) {
-            printf("%d ", s[i]._limbs[0]);
-        }
-    }
 
-    cgbn_store(bn_env, &data[gpos], s[spos]);
-    cgbn_store(bn_env, &data[gpos + stride], s[spos + 1]);
+    if (num_part < bits / 32) {
+        data[gpos]._limbs[num_part] = s[spos]._limbs[num_part];
+        data[gpos + stride]._limbs[num_part] = s[spos + 1]._limbs[num_part];
+    }
 
 }
 
@@ -311,11 +309,11 @@ void NTT_GZKP(cgbn_mem_t<bits> data[], uint len, uint2 reverse[], uint reverse_l
     dim3 grid1((len / 2 - 1) / block.x + 1);
     block.x *= tpi;
 
-    // rearrange<tpi, bits> <<< grid0, block0 >>>(data, reverse, reverse_len);
+    rearrange<tpi, bits> <<< grid0, block0 >>>(data, reverse, reverse_len);
 
     uint stride = 1;
     for (; stride < G; stride <<= 1) {
-        // naive<tpi, bits> <<< grid1, block >>>(data, len, roots_d, stride, prime);
+        naive<tpi, bits> <<< grid1, block >>>(data, len, roots_d, stride, prime);
     }
 
     for (; stride << B <= len; stride <<= B) {
@@ -369,7 +367,7 @@ int main() {
     int logl = 0;
 
     //scanf("%lld", &l);
-    l = 16;qpow(2, 24);
+    l = qpow(2, 24);
 
     while (length < l) {
         length <<= 1ll;
@@ -446,18 +444,18 @@ int main() {
 
     // GZKP approach
 
-    // cudaMemcpy(data_d, data_copy, length * sizeof(*data_d), cudaMemcpyHostToDevice);
+    cudaMemcpy(data_d, data_copy, length * sizeof(*data_d), cudaMemcpyHostToDevice);
 
-    // NTT_GZKP<TPI, BITS>(data_d, length, reverse2_d, reverse_num, prime, omega, 2, 4);
+    NTT_GZKP<TPI, BITS>(data_d, length, reverse2_d, reverse_num, prime, omega, 2, 4);
 
-    // cudaMemcpy(tmp, data_d, sizeof(*data_d) * length, cudaMemcpyDeviceToHost);
+    cudaMemcpy(tmp, data_d, sizeof(*data_d) * length, cudaMemcpyDeviceToHost);
 
-    // for (long long i = 0; i < length; i++) {
-    //     long long cur = cgbn_to_int64(tmp[i]);
-    //     if (data[i] != cur) {
-    //         printf("%lld %lld %lld\n", data[i], cur, i);
-    //     }
-    // }
+    for (long long i = 0; i < length; i++) {
+        long long cur = cgbn_to_int64(tmp[i]);
+        if (data[i] != cur) {
+            printf("%lld %lld %lld\n", data[i], cur, i);
+        }
+    }
 
     
     // NTT(data, reverse, length, inv(root));
