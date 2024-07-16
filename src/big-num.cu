@@ -8,8 +8,8 @@
 
 #define P (469762049      ) // 4179340454199820289 29 * 2^57 + 1ll
 #define root (3)
-#define TPI 4
-#define BITS 128
+#define TPI 8
+#define BITS 256
 
 typedef cgbn_context_t<TPI> context_t;
 typedef cgbn_env_t<context_t, BITS> env_t;
@@ -190,14 +190,14 @@ __global__ void GZKP (cgbn_mem_t<bits> data[],  uint len, cgbn_mem_t<bits> roots
     gpos = start + ioid + iogroup * 2 * stride;
 
     // load to shared memory
-    if (gpos + stride >= len) return;
+    // if (gpos + stride >= len) return;
 
     uint num_part = threadIdx.x & (tpi - 1);
 
-    if (num_part < bits / 32) {
+    // if (num_part < bits / 32) {
         s[spos]._limbs[num_part] = data[gpos]._limbs[num_part];
         s[spos + 1]._limbs[num_part] = data[gpos + stride]._limbs[num_part];
-    }
+    // }
     
     uint cid = id % csize; // id of the compute group
     uint base =  (id - cid) << 1; // base pos of the compute group
@@ -206,7 +206,8 @@ __global__ void GZKP (cgbn_mem_t<bits> data[],  uint len, cgbn_mem_t<bits> roots
     typename env_t::cgbn_wide_t wtmp;
     cgbn_load(bn_env, mod, &prime);
 
-    for (uint i = 1, step = 1; i <= B && stride * step < len; i++, step *= 2) {
+    #pragma unroll
+    for (uint i = 1, step = 1; i <= B /* && stride * step < len */; i++, step *= 2) {
         __syncthreads();
 
         uint offset = step * 2 * ((uint)(cid / step)) + cid % step;
@@ -245,10 +246,10 @@ __global__ void GZKP (cgbn_mem_t<bits> data[],  uint len, cgbn_mem_t<bits> roots
     
     __syncthreads();
 
-    if (num_part < bits / 32) {
+    // if (num_part < bits / 32) {
         data[gpos]._limbs[num_part] = s[spos]._limbs[num_part];
         data[gpos + stride]._limbs[num_part] = s[spos + 1]._limbs[num_part];
-    }
+    // }
 
 }
 
@@ -260,7 +261,7 @@ void NTT_GZKP(cgbn_mem_t<bits> data[], uint len, uint2 reverse[], uint reverse_l
 
     dim3 block(qpow(2,B)*G/2);
     assert(block.x * tpi <= 1024);
-    assert(bits / 32 <= tpi);
+    assert(bits / 32 == tpi);
 
 
     int dev = 0;
@@ -446,7 +447,7 @@ int main() {
 
     cudaMemcpy(data_d, data_copy, length * sizeof(*data_d), cudaMemcpyHostToDevice);
 
-    NTT_GZKP<TPI, BITS>(data_d, length, reverse2_d, reverse_num, prime, omega, 2, 4);
+    NTT_GZKP<TPI, BITS>(data_d, length, reverse2_d, reverse_num, prime, omega, 5, 8);
 
     cudaMemcpy(tmp, data_d, sizeof(*data_d) * length, cudaMemcpyDeviceToHost);
 
