@@ -8,8 +8,8 @@
 
 #define P (469762049      ) // 4179340454199820289 29 * 2^57 + 1ll
 #define root (3)
-#define TPI 8
-#define BITS 256
+#define TPI 4
+#define BITS 128
 
 typedef cgbn_context_t<TPI> context_t;
 typedef cgbn_env_t<context_t, BITS> env_t;
@@ -78,7 +78,6 @@ __global__ void naive(cgbn_mem_t<bits> data[], long long len, cgbn_mem_t<bits> r
     uint pos = ((id - offset) << 1ll) + offset;
 
     typename env_t::cgbn_t  a, b, w, ra, rb, mod;
-    typename env_t::cgbn_wide_t wtmp;
 
     cgbn_load(bn_env, mod, &prime);
     cgbn_load(bn_env, a, &data[pos]);
@@ -86,18 +85,21 @@ __global__ void naive(cgbn_mem_t<bits> data[], long long len, cgbn_mem_t<bits> r
     cgbn_load(bn_env, w, &roots[offset * len / (stride << 1ll)]);
 
     // b = w * data[pos + stride] % P
-    cgbn_mul_wide(bn_env, wtmp, w, b);
-    cgbn_rem_wide(bn_env, b, wtmp, mod);
+    uint32_t np0;
+    np0 = cgbn_bn2mont(bn_env, b, b, mod);
+    cgbn_bn2mont(bn_env, w, w, mod);
+    cgbn_mont_mul(bn_env, b, w, b, mod, np0);
+    cgbn_mont2bn(bn_env, b, b, mod, np0);
 
     // data[pos] = (a + b) % P
     cgbn_add(bn_env, ra, a, b);
-    cgbn_rem(bn_env, ra, ra, mod);
+    if (cgbn_compare(bn_env, ra, mod) >= 0) cgbn_sub(bn_env, ra, ra, mod);
     cgbn_store(bn_env, &data[pos], ra);
 
     // data[pos + stride] = (a - b + P) % P
     cgbn_add(bn_env, rb, a, mod);
     cgbn_sub(bn_env, rb, rb, b);
-    cgbn_rem(bn_env, rb, rb, mod);
+    if (cgbn_compare(bn_env, rb, mod) >= 0) cgbn_sub(bn_env, rb, rb, mod);
     cgbn_store(bn_env, &data[pos + stride], rb);
 }
 
@@ -111,7 +113,7 @@ void NTT_GPU_Naive(cgbn_mem_t<bits> data[], uint len, uint2 reverse[], uint reve
     cudaEventCreate(&start);
     cudaEventCreate(&end);
 
-    cudaEventRecord(start);
+    
 
     cgbn_mem_t<bits> *roots, *roots_d;
     roots = (cgbn_mem_t<bits> *)malloc(sizeof(*roots) * len);
@@ -149,6 +151,8 @@ void NTT_GPU_Naive(cgbn_mem_t<bits> data[], uint len, uint2 reverse[], uint reve
     dim3 grid((reverse_len - 1) / block.x + 1);
     dim3 grid1((len / 2 - 1) / block.x + 1);
     block.x *= tpi;
+
+    cudaEventRecord(start);
     rearrange<tpi, bits> <<< grid, block >>>(data, reverse, reverse_len);
     for (long long stride = 1ll; stride < len; stride <<= 1ll) {
         naive<tpi, bits> <<< grid1, block >>>(data, len, roots_d, stride, prime);
@@ -175,12 +179,12 @@ __global__ void GZKP (cgbn_mem_t<bits> data[],  uint len, cgbn_mem_t<bits> roots
     context_t bn_context;
     env_t bn_env(bn_context);
 
-    uint start = (G * blockIdx.x) % stride + (G * blockIdx.x / stride) * stride * csize * 2;
+    uint start = ((G * blockIdx.x) & (stride - 1)) + (G * blockIdx.x / stride) * stride * csize * 2;
 
-    uint id = threadIdx.x / tpi;;
+    uint id = threadIdx.x / tpi;
 
     uint iogroup = id / G; // io group
-    uint ioid = id % G; // id in the io group
+    uint ioid = id & G-1; // id in the io group
 
     uint spos; // load to
     uint gpos; // load from
@@ -199,18 +203,17 @@ __global__ void GZKP (cgbn_mem_t<bits> data[],  uint len, cgbn_mem_t<bits> roots
         s[spos + 1]._limbs[num_part] = data[gpos + stride]._limbs[num_part];
     // }
     
-    uint cid = id % csize; // id of the compute group
+    uint cid = id & csize-1; // id of the compute group
     uint base =  (id - cid) << 1; // base pos of the compute group
 
     typename env_t::cgbn_t x, y, w, a, b, mod;
-    typename env_t::cgbn_wide_t wtmp;
     cgbn_load(bn_env, mod, &prime);
 
     #pragma unroll
     for (uint i = 1, step = 1; i <= B /* && stride * step < len */; i++, step *= 2) {
         __syncthreads();
 
-        uint offset = step * 2 * ((uint)(cid / step)) + cid % step;
+        uint offset = step * 2 * ((uint)(cid / step)) + (cid & step-1);
 
         uint io_thread_id = id / csize + offset / 2 * G;
 
@@ -218,27 +221,28 @@ __global__ void GZKP (cgbn_mem_t<bits> data[],  uint len, cgbn_mem_t<bits> roots
         ioid = (io_thread_id) - iogroup * G;
 
         uint tmp = start + ioid + iogroup * 2 * stride + (offset & 1) * stride;
-        tmp = tmp % (stride * step * 2);
+        tmp = tmp & (stride * step * 2 - 1);
         tmp = tmp * (len / (stride * step * 2));
 
         cgbn_load(bn_env, w, &roots[tmp]);
-        cgbn_load(bn_env, x, &s[base + offset]);
-        cgbn_load(bn_env, y, &s[base + offset + step]);
+        cgbn_load(bn_env, a, &s[base + offset]);
+        cgbn_load(bn_env, b, &s[base + offset + step]);
 
-        // a = s[base + offset]
-        cgbn_set(bn_env, a, x);
         // b = w * s[base + offset + step] % P
-        cgbn_mul_wide(bn_env, wtmp, w, y);
-        cgbn_rem_wide(bn_env, b, wtmp, mod);
+        uint32_t np0;
+        np0 = cgbn_bn2mont(bn_env, b, b, mod);
+        cgbn_bn2mont(bn_env, w, w, mod);
+        cgbn_mont_mul(bn_env, b, w, b, mod, np0);
+        cgbn_mont2bn(bn_env, b, b, mod, np0);
 
         // s[base + offset] = (a + b) % P;
         cgbn_add(bn_env, x, a, b);
-        cgbn_rem(bn_env, x, x, mod);
+        if (cgbn_compare(bn_env, x, mod) >= 0) cgbn_sub(bn_env, x, x, mod);
 
         // s[base + offset + step] = (a - b + P) % P;
         cgbn_add(bn_env, y, a, mod);
         cgbn_sub(bn_env, y, y, b);
-        cgbn_rem(bn_env, y, y, mod);
+        if (cgbn_compare(bn_env, y, mod) >= 0) cgbn_sub(bn_env, y, y, mod);
 
         cgbn_store(bn_env, &s[base + offset], x);
         cgbn_store(bn_env, &s[base + offset + step], y);
@@ -270,7 +274,6 @@ void NTT_GZKP(cgbn_mem_t<bits> data[], uint len, uint2 reverse[], uint reverse_l
     cudaGetDeviceProperties(&deviceProp,dev);
     //assert(deviceProp.sharedMemPerBlock >= sizeof(long long) * qpow(2,B) * G * 2 + sizeof(long long) * len);
 
-    cudaEventRecord(start);
 
     cgbn_mem_t<bits> *roots, *roots_d;
     roots = (cgbn_mem_t<bits> *)malloc(sizeof(*roots) * len);
@@ -309,6 +312,9 @@ void NTT_GZKP(cgbn_mem_t<bits> data[], uint len, uint2 reverse[], uint reverse_l
     dim3 grid0((reverse_len - 1) / block0.x + 1);
     dim3 grid1((len / 2 - 1) / block.x + 1);
     block.x *= tpi;
+
+    cudaEventRecord(start);
+
 
     rearrange<tpi, bits> <<< grid0, block0 >>>(data, reverse, reverse_len);
 
@@ -447,7 +453,7 @@ int main() {
 
     cudaMemcpy(data_d, data_copy, length * sizeof(*data_d), cudaMemcpyHostToDevice);
 
-    NTT_GZKP<TPI, BITS>(data_d, length, reverse2_d, reverse_num, prime, omega, 5, 8);
+    NTT_GZKP<TPI, BITS>(data_d, length, reverse2_d, reverse_num, prime, omega, 6, 8);
 
     cudaMemcpy(tmp, data_d, sizeof(*data_d) * length, cudaMemcpyDeviceToHost);
 
