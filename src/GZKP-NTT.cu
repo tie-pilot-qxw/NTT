@@ -81,7 +81,6 @@ void NTT_GPU_Naive(long long data[], longlong2 reverse[], long long len, long lo
     roots = new long long [len];
     long long gap = qpow(omega, (P - 1ll) / len);
     roots[0] = 1;
-    printf("%lld\n", gap);
     for (long long i = 1; i < len; i++) roots[i] = roots[i - 1] * gap % P;
     
     cudaMalloc(&roots_d, len * sizeof(*roots_d));
@@ -232,13 +231,74 @@ void NTT_GZKP(long long data[], longlong2 reverse[], long long len, long long om
     delete [] tmp;
 }
 
+__global__ void naive_no_swap(long long x[], long long y[], long long len, long long roots[], uint stride) {
+    uint i = blockDim.x * blockIdx.x + threadIdx.x;
+    uint t = len / 2;
+    if(i + t >= len) return;
+    uint k = i & (stride - 1);
+
+    long long a = x[i], b = x[i + t];
+    long long w = roots[k * (len / (stride << 1))];
+    b = b * w % P;
+    long long tmp = a + P - b;
+    if (tmp >= P) tmp -= P;
+    a += b;
+    if (a >= P) a -= P;
+    b = tmp;
+
+    uint j = (i << 1) - k;
+    y[j] = a;
+    y[j + stride] = b;
+}
+
+long long * No_Swap(long long *x, long long *y, long long len, long long omega) {
+    cudaEvent_t start, end;
+    cudaEventCreate(&start);
+    cudaEventCreate(&end);
+
+    cudaEventRecord(start);
+
+    long long *roots, *roots_d;
+    roots = new long long [len];
+    long long gap = qpow(omega, (P - 1ll) / len);
+    roots[0] = 1;
+    for (long long i = 1; i < len; i++) roots[i] = roots[i - 1] * gap % P;
+    
+    cudaMalloc(&roots_d, len * sizeof(*roots_d));
+    cudaMemcpy(roots_d, roots, len * sizeof(*roots_d), cudaMemcpyHostToDevice);
+
+
+
+    dim3 block(768);
+    dim3 grid1((len / 2 - 1) / block.x + 1);
+    long long *res = new long long [len];
+
+    for (long long stride = 1ll; stride < len; stride <<= 1ll) {
+        naive_no_swap <<< grid1, block >>>(x, y, len, roots_d, stride);
+        long long *tmp = x;
+        x = y;
+        y = tmp;
+    }
+    cudaEventRecord(end);
+    cudaEventSynchronize(end);
+
+    float t;
+    cudaEventElapsedTime(&t, start, end);
+
+    printf("no_swap: %fms\n", t);
+
+    cudaFree(roots_d);
+    delete [] roots;
+    return x;
+}
+
 int main() {
     long long *data, *reverse, *data_copy;
     long long l,length = 1ll;
     int bits = 0;
 
     //scanf("%lld", &l);
-    l = 16;//qpow(2, 24);
+    l = qpow(2, 23);
 
     while (length < l) {
         length <<= 1ll;
@@ -320,6 +380,19 @@ int main() {
         }
     }
 
+    // NO swap
+    long long *data_p;
+    cudaMalloc(&data_p, length * sizeof(*data_p));
+
+    cudaMemcpy(data_d, data_copy, length * sizeof(*data_d), cudaMemcpyHostToDevice);
+    data_d = No_Swap(data_d, data_p, length, root);
+    cudaMemcpy(tmp, data_d, sizeof(*data_d) * length, cudaMemcpyDeviceToHost);
+
+    for (long long i = 0; i < length; i++) {
+        if (data[i] != tmp[i]) {
+            printf("%lld %lld %lld\n", data[i], tmp[i], i);
+        }
+    }
     
     // NTT(data, reverse, length, inv(root));
 

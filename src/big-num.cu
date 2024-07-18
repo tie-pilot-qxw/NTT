@@ -8,8 +8,8 @@
 
 #define P (469762049      ) // 4179340454199820289 29 * 2^57 + 1ll
 #define root (3)
-#define TPI 4
-#define BITS 128
+#define TPI 8
+#define BITS 256
 
 typedef cgbn_context_t<TPI> context_t;
 typedef cgbn_env_t<context_t, BITS> env_t;
@@ -367,6 +367,7 @@ long long cgbn_to_int64(const cgbn_mem_t<bits> &x) {
 }
 
 int main() {
+    for (int kk = 5; kk <= 24; kk ++) {
     long long *data;
     uint *reverse;
     cgbn_mem_t<BITS> *data_copy;
@@ -374,7 +375,7 @@ int main() {
     int logl = 0;
 
     //scanf("%lld", &l);
-    l = qpow(2, 24);
+    l = qpow(2, kk);
 
     while (length < l) {
         length <<= 1ll;
@@ -384,9 +385,10 @@ int main() {
     assert(length == (1ll << logl));
     assert(logl <= 26);
 
-    data = new long long[length];
+    data = (long long *) malloc(sizeof(*data) * length);
     data_copy = (cgbn_mem_t<BITS> *)malloc(sizeof(*data_copy) * length);
-    reverse = new uint[length];
+    reverse = (uint*)malloc(sizeof(uint) * length);
+    memset(reverse, 0, sizeof(uint) * length);
 
     for (uint i = 0; i < length; i++) {
         reverse[i] = (reverse[i >> 1ll] >> 1ll) | ((i & 1ll) << (logl - 1ll) ); //reverse the bits
@@ -453,7 +455,7 @@ int main() {
 
     cudaMemcpy(data_d, data_copy, length * sizeof(*data_d), cudaMemcpyHostToDevice);
 
-    NTT_GZKP<TPI, BITS>(data_d, length, reverse2_d, reverse_num, prime, omega, 6, 8);
+    NTT_GZKP<TPI, BITS>(data_d, length, reverse2_d, reverse_num, prime, omega, 5, 8);
 
     cudaMemcpy(tmp, data_d, sizeof(*data_d) * length, cudaMemcpyDeviceToHost);
 
@@ -476,9 +478,11 @@ int main() {
     cudaFree(data_d);
     cudaFree(reverse2_d);
 
-    delete [] data;
+    free(data);
+    free(reverse2);
     free(data_copy);
-    delete [] reverse;
+    free(reverse);
     free(tmp);
+    }
     return 0;
 }
