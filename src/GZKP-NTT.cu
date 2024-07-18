@@ -75,7 +75,6 @@ void NTT_GPU_Naive(long long data[], longlong2 reverse[], long long len, long lo
     cudaEventCreate(&start);
     cudaEventCreate(&end);
 
-    cudaEventRecord(start);
 
     long long *roots, *roots_d;
     roots = new long long [len];
@@ -92,6 +91,7 @@ void NTT_GPU_Naive(long long data[], longlong2 reverse[], long long len, long lo
     dim3 block(768);
     dim3 grid((reverse_num - 1) / block.x + 1);
     dim3 grid1((len / 2 - 1) / block.x + 1);
+    cudaEventRecord(start);
     rearrange <<< grid, block >>>(data, reverse, reverse_num);
     for (long long stride = 1ll; stride < len; stride <<= 1ll) {
         naive <<< grid1, block >>>(data, len, roots_d, stride);
@@ -178,7 +178,6 @@ void NTT_GZKP(long long data[], longlong2 reverse[], long long len, long long om
     cudaGetDeviceProperties(&deviceProp,dev);
     //assert(deviceProp.sharedMemPerBlock >= sizeof(long long) * qpow(2,B) * G * 2 + sizeof(long long) * len);
 
-    cudaEventRecord(start);
 
     long long *roots, *roots_d;
     roots = new long long [len];
@@ -196,6 +195,7 @@ void NTT_GZKP(long long data[], longlong2 reverse[], long long len, long long om
     dim3 block0(768);
     dim3 grid0((reverse_num - 1) / block0.x + 1);
     dim3 grid1((len / 2 - 1) / block.x + 1);
+    cudaEventRecord(start);
 
     rearrange <<< grid0, block0 >>>(data, reverse, reverse_num);
 
@@ -259,7 +259,6 @@ long long * No_Swap(long long *x, long long *y, long long len, long long omega) 
     cudaEventCreate(&start);
     cudaEventCreate(&end);
 
-    cudaEventRecord(start);
 
     long long *roots, *roots_d;
     roots = new long long [len];
@@ -270,6 +269,7 @@ long long * No_Swap(long long *x, long long *y, long long len, long long omega) 
     cudaMalloc(&roots_d, len * sizeof(*roots_d));
     cudaMemcpy(roots_d, roots, len * sizeof(*roots_d), cudaMemcpyHostToDevice);
 
+    cudaEventRecord(start);
 
 
     dim3 block(768);
@@ -391,7 +391,6 @@ long long * bellperson_baseline(long long *x, long long *y,long long omega, uint
     cudaEvent_t start, end;
     cudaEventCreate(&start);
     cudaEventCreate(&end);
-    cudaEventRecord(start);
 
 
 
@@ -436,6 +435,9 @@ long long * bellperson_baseline(long long *x, long long *y,long long omega, uint
 
     // Specifies log2 of `p`, (http://www.bealto.com/gpu-fft_group-1.html)
     uint log_p = 0u;
+    
+    cudaEventRecord(start);
+
     // Each iteration performs a FFT round
     while (log_p < log_n) {
 
