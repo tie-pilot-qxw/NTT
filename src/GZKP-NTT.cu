@@ -4,7 +4,7 @@
 #include <cuda_runtime.h>
 #include <ctime>
 
-#define P (998244353 ) // 29 * 2^57 + 1ll
+#define P (469762049 ) // 29 * 2^57 + 1ll
 #define root (3)
 
 inline long long qpow(long long x, long long y) {
@@ -95,6 +95,9 @@ void NTT_GPU_Naive(long long data[], longlong2 reverse[], long long len, long lo
     rearrange <<< grid, block >>>(data, reverse, reverse_num);
     for (long long stride = 1ll; stride < len; stride <<= 1ll) {
         naive <<< grid1, block >>>(data, len, roots_d, stride);
+        // cudaMemcpy(tmp, data, sizeof(*tmp) * len, cudaMemcpyDeviceToHost);
+        // for (int i = 0; i < len; i++) printf("%lld ", tmp[i]);
+        // printf("\n");
     }
     cudaEventRecord(end);
     cudaEventSynchronize(end);
@@ -292,13 +295,190 @@ long long * No_Swap(long long *x, long long *y, long long len, long long omega) 
     return x;
 }
 
+__forceinline__ __device__ long long FIELD_pow_lookup(long long *omegas, uint exponent) {
+    long long res = 1ll;
+    uint i = 0;
+    while(exponent > 0) {
+        if (exponent & 1)
+        res = (res * omegas[i]) % P;
+        exponent = exponent >> 1;
+        i++;
+    }
+    return res;
+}
+
+__forceinline__ __device__ long long FIELD_pow (long long base, uint exponent) {
+    long long res = 1;
+    while(exponent > 0) {
+        if (exponent & 1)
+        res = (res * base) % P;
+        exponent = exponent >> 1;
+        base = (base * base) % P;
+    }
+    return res;
+}
+
+/*
+ * FFT algorithm is inspired from: http://www.bealto.com/gpu-fft_group-1.html
+ */
+__global__ void FIELD_radix_fft(long long * x, // Source buffer
+                      long long * y, // Destination buffer
+                      long long * pq, // Precalculated twiddle factors
+                      long long * omegas, // [omega, omega^2, omega^4, ...]
+                      uint n, // Number of elements
+                      uint lgp, // Log2 of `p` (Read more in the link above)
+                      uint deg, // 1=>radix2, 2=>radix4, 3=>radix8, ...
+                      uint max_deg) // Maximum degree supported, according to `pq` and `omegas`
+{
+// CUDA doesn't support local buffers ("shared memory" in CUDA lingo) as function arguments,
+// ignore that argument and use the globally defined extern memory instead.
+
+    // There can only be a single dynamic shared memory item, hence cast it to the type we need.
+    extern __shared__ long long u[];
+
+    uint lid = threadIdx.x;//GET_LOCAL_ID();
+    uint lsize = blockDim.x;//GET_LOCAL_SIZE();
+    uint index = blockIdx.x;//GET_GROUP_ID();
+    uint t = n >> deg;
+    uint p = 1 << lgp;
+    uint k = index & (p - 1);
+
+    x += index;
+    y += ((index - k) << deg) + k;
+
+    uint count = 1 << deg; // 2^deg
+    uint counth = count >> 1; // Half of count
+
+    uint counts = count / lsize * lid;
+    uint counte = counts + count / lsize;
+
+    // Compute powers of twiddle
+    const long long twiddle = FIELD_pow_lookup(omegas, (n >> lgp >> deg) * k);
+    long long tmp = FIELD_pow(twiddle, counts);
+    for(uint i = counts; i < counte; i++) {
+      u[i] = (tmp * x[i*t]) % P;
+      tmp = (tmp * twiddle) % P;
+    }
+
+    __syncthreads();
+
+    const uint pqshift = max_deg - deg;
+    for(uint rnd = 0; rnd < deg; rnd++) {
+      const uint bit = counth >> rnd;
+      for(uint i = counts >> 1; i < counte >> 1; i++) {
+        const uint di = i & (bit - 1);
+        const uint i0 = (i << 1) - di;
+        const uint i1 = i0 + bit;
+        tmp = u[i0];
+        u[i0] = (u[i0] + u[i1]) % P;
+        u[i1] = (tmp + P - u[i1]) % P;
+        if(di != 0) u[i1] = (pq[di << rnd << pqshift] * u[i1]) % P;
+      }
+
+      __syncthreads();
+    }
+    
+
+    for(uint i = counts >> 1; i < counte >> 1; i++) {
+        y[i*p] = u[__brev(i) >> (32 - deg)];
+        y[(i+counth)*p] = u[__brev(i + counth) >> (32 - deg)];
+    }
+}
+
+#define MAX_LOG2_RADIX 8u
+long long * bellperson_baseline(long long *x, long long *y,long long omega, uint log_n) {
+
+    cudaEvent_t start, end;
+    cudaEventCreate(&start);
+    cudaEventCreate(&end);
+    cudaEventRecord(start);
+
+
+
+    uint n = 1 << log_n;
+
+    omega = qpow(omega, (P - 1ll) / n);
+    // All usages are safe as the buffers are initialized from either the host or the GPU
+    // before they are read.
+    // let mut src_buffer = unsafe { program.create_buffer::<F>(n)? };
+    // let mut dst_buffer = unsafe { program.create_buffer::<F>(n)? };
+    // The precalculated values pq` and `omegas` are valid for radix degrees up to `max_deg`
+    uint max_deg = std::min(MAX_LOG2_RADIX, log_n);
+
+    // Precalculate:
+    // [omega^(0/(2^(deg-1))), omega^(1/(2^(deg-1))), ..., omega^((2^(deg-1)-1)/(2^(deg-1)))]
+    long long *pq, *pq_d;
+    long long *omegas, *omegas_d;
+    pq = new long long[1 << max_deg >> 1];
+    memset (pq, 0, sizeof(long long) * (1 << max_deg >> 1));
+    pq[0] = 1;
+    long long twiddle = qpow(omega, ((long long)n) >> (1ll*max_deg));
+    if (max_deg > 1) {
+        pq[1] = twiddle;
+        for (uint i = 2; i < (1 << max_deg >> 1) ; i++ ) {
+            pq[i] = pq[i - 1];
+            pq[i] = pq[i] *(twiddle)%P;
+        }
+    }
+    cudaMalloc(&pq_d, sizeof(long long) * (1 << max_deg >> 1));
+    cudaMemcpy(pq_d, pq, sizeof(long long) * (1 << max_deg >> 1), cudaMemcpyHostToDevice);
+
+    // Precalculate [omega, omega^2, omega^4, omega^8, ..., omega^(2^31)]
+    omegas = new long long[32];
+    memset (omegas, 0, sizeof(long long) * 32);
+    omegas[0] = omega;
+    for (uint i  = 1; i < 32; i++) {
+        omegas[i] = omegas[i - 1] * omegas[i - 1] % P;
+    }
+    cudaMalloc(&omegas_d, sizeof(long long) * 32);
+    cudaMemcpy(omegas_d, omegas, sizeof(long long) * 32, cudaMemcpyHostToDevice);
+    long long *res = new long long[n];
+
+    // Specifies log2 of `p`, (http://www.bealto.com/gpu-fft_group-1.html)
+    uint log_p = 0u;
+    // Each iteration performs a FFT round
+    while (log_p < log_n) {
+
+        // 1=>radix2, 2=>radix4, 3=>radix8, ...
+        uint deg = std::min(max_deg, log_n - log_p);
+
+        uint n = 1u << log_n;
+        dim3 block(1 << std::min(deg - 1, 10u) );
+        uint grid(n >> deg);
+
+        FIELD_radix_fft <<< grid, block, sizeof(long long) * (1 << deg) >>>(x, y, pq_d, omegas_d, n, log_p, deg, max_deg);
+
+        log_p += deg;
+        long long * tmp = x;
+        x = y;
+        y = tmp;
+        // cudaMemcpy(res, x, sizeof(*res) * n, cudaMemcpyDeviceToHost);
+        // for (int i = 0; i < n; i++) printf("%lld ", res[i]);
+        // printf("\n");
+    }
+    cudaEventRecord(end);
+    cudaEventSynchronize(end);
+
+    float t;
+    cudaEventElapsedTime(&t, start, end);
+    delete [] res;
+
+    printf("bellman: %fms\n", t);
+    free(pq);
+    free(omegas);
+    cudaFree(pq_d);
+    cudaFree(omegas_d);
+    return x;
+}
+
+
 int main() {
     long long *data, *reverse, *data_copy;
     long long l,length = 1ll;
     int bits = 0;
 
     //scanf("%lld", &l);
-    l = qpow(2, 23);
+    l = qpow(2, 26);
 
     while (length < l) {
         length <<= 1ll;
@@ -319,7 +499,7 @@ int main() {
     std::random_device rd;
     std::mt19937_64 gen(rd());
     for (long long i = 0; i < length; i++) {
-        data[i] = std::abs((long long)gen()) % P;
+        data[i] = i; std::abs((long long)gen()) % P;
         data_copy[i] = data[i];
     }
 
@@ -385,14 +565,26 @@ int main() {
     cudaMalloc(&data_p, length * sizeof(*data_p));
 
     cudaMemcpy(data_d, data_copy, length * sizeof(*data_d), cudaMemcpyHostToDevice);
-    data_d = No_Swap(data_d, data_p, length, root);
-    cudaMemcpy(tmp, data_d, sizeof(*data_d) * length, cudaMemcpyDeviceToHost);
+    long long *res = No_Swap(data_d, data_p, length, root);
+    cudaMemcpy(tmp, res, sizeof(*res) * length, cudaMemcpyDeviceToHost);
 
     for (long long i = 0; i < length; i++) {
         if (data[i] != tmp[i]) {
             printf("%lld %lld %lld\n", data[i], tmp[i], i);
         }
     }
+
+    // bellperson
+    cudaMemcpy(data_d, data_copy, length * sizeof(*data_d), cudaMemcpyHostToDevice);
+    res = bellperson_baseline(data_d, data_p, root, bits);
+    cudaMemcpy(tmp, res, sizeof(*res) * length, cudaMemcpyDeviceToHost);
+    for (long long i = 0; i < length; i++) {
+        if (data[i] != tmp[i]) {
+            printf("%lld %lld %lld\n", data[i], tmp[i], i);
+        }
+    }
+
+    cudaFree(data_p);
     
     // NTT(data, reverse, length, inv(root));
 
