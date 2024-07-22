@@ -4,7 +4,7 @@
 #include <cuda_runtime.h>
 #include <ctime>
 
-#define P (4179340454199820289) // 29 * 2^57 + 1ll
+#define P (469762049) // 29 * 2^57 + 1ll
 #define root (3)
 
 inline long long qpow(long long x, long long y) {
@@ -75,7 +75,6 @@ void NTT_GPU_Naive(long long data[], longlong2 reverse[], long long len, long lo
     cudaEventCreate(&start);
     cudaEventCreate(&end);
 
-    cudaEventRecord(start);
 
     long long *roots, *roots_d;
     roots = new long long [len];
@@ -92,6 +91,9 @@ void NTT_GPU_Naive(long long data[], longlong2 reverse[], long long len, long lo
     dim3 block(768);
     dim3 grid((reverse_num - 1) / block.x + 1);
     dim3 grid1((len / 2 - 1) / block.x + 1);
+    
+    cudaEventRecord(start);
+
     rearrange <<< grid, block >>>(data, reverse, reverse_num);
     for (long long stride = 1ll; stride < len; stride <<= 1ll) {
         naive <<< grid1, block >>>(data, len, roots_d, stride);
@@ -204,7 +206,6 @@ void NTT_GZKP(long long data[], longlong2 reverse[], long long len, long long om
     cudaGetDeviceProperties(&deviceProp,dev);
     //assert(deviceProp.sharedMemPerBlock >= sizeof(long long) * qpow(2,B) * G * 2 + sizeof(long long) * len);
 
-    cudaEventRecord(start);
 
     long long *roots, *roots_d;
     roots = new long long [len];
@@ -218,6 +219,7 @@ void NTT_GZKP(long long data[], longlong2 reverse[], long long len, long long om
     dim3 block0(768);
     dim3 grid0((reverse_num - 1) / block0.x + 1);
     dim3 grid1((len - 1) / block.x + 1);
+    cudaEventRecord(start);
 
     rearrange <<< grid0, block0 >>>(data, reverse, reverse_num);
 
@@ -260,7 +262,7 @@ int main() {
     int bits = 0;
 
     //scanf("%lld", &l);
-    l = qpow(2,24);
+    l = qpow(2,26);
 
     while (length < l) {
         length <<= 1ll;

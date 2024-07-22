@@ -473,7 +473,7 @@ long long * bellperson_baseline(long long *x, long long *y,long long omega, uint
     return x;
 }
 
-__global__ void improved_GZKP_bellperson(long long * x, // Source buffer
+__global__ void improve_grouped(long long * x, // Source buffer
                       long long * y, // Destination buffer
                       long long * pq, // Precalculated twiddle factors
                       long long * omegas, // [omega, omega^2, omega^4, ...]
@@ -497,7 +497,7 @@ __global__ void improved_GZKP_bellperson(long long * x, // Source buffer
 
     // printf("%u %u %u\n", gid, index, blockIdx.x);
     // if (blockIdx.x == 0 && threadIdx.x == 0) {
-    //     printf("%u %u %u %u %u\n", blockDim.x, deg, lsize, blockDim.x, group_sz);
+    //     printf("%u %u %u %u\n", blockDim.x, deg, lsize, group_sz);
     // }
     x += index;
     y += ((index - k) << deg) + k;
@@ -549,7 +549,96 @@ __global__ void improved_GZKP_bellperson(long long * x, // Source buffer
     }
 }
 
-long long * improved_NTT(long long *x, long long *y,long long omega, uint log_n, uint log_g) {
+__global__ void improve_group_coalesced_read(long long * x, // Source buffer
+                      long long * y, // Destination buffer
+                      long long * pq, // Precalculated twiddle factors
+                      long long * omegas, // [omega, omega^2, omega^4, ...]
+                      uint n, // Number of elements
+                      uint lgp, // Log2 of `p` (Read more in the link above)
+                      uint deg, // 1=>radix2, 2=>radix4, 3=>radix8, ...
+                      uint max_deg, // Maximum degree supported, according to `pq` and `omegas`
+                      uint group_sz) // size of a group
+{
+    extern __shared__ long long u_g[];
+    
+    uint lid = threadIdx.x & (group_sz - 1);//GET_LOCAL_ID();
+    uint lsize = group_sz;//GET_LOCAL_SIZE();
+    uint gid = threadIdx.x / group_sz;
+    uint group_num = blockDim.x / group_sz;
+    uint index = blockIdx.x * group_num + gid;//GET_GROUP_ID();
+    uint t = n >> deg;
+    uint p = 1 << lgp;
+    uint k = index & (p - 1);
+    uint offset = (lsize << 1) * gid;
+
+    // printf("%u %u %u\n", gid, index, blockIdx.x);
+    // if (blockIdx.x == 0 && threadIdx.x == 0) {
+    //     printf("%u %u %u %u %u\n", blockDim.x, deg, lsize, blockDim.x, group_sz);
+    // }
+
+
+    uint count = 1 << deg; // 2^deg
+    uint counth = count >> 1; // Half of count
+
+    uint counts = count / lsize * lid;
+    uint counte = counts + count / lsize;
+
+    uint gid_read = threadIdx.x & (group_num - 1); // group id for reading
+    uint index_read = blockIdx.x * group_num + gid_read;
+    uint lid_read = threadIdx.x / group_num;
+    uint k_read = index_read & (p - 1);
+    uint offset_read = (lsize << 1) * gid_read;
+
+    uint counts_read = count / lsize * lid_read;
+    uint counte_read = counts_read + count / lsize;
+
+    x += index_read;
+    y += ((index - k) << deg) + k;
+    long long *u = u_g + offset_read;
+
+    // Compute powers of twiddle
+    const long long twiddle = FIELD_pow_lookup(omegas, (n >> lgp >> deg) * k_read);
+    long long tmp = FIELD_pow(twiddle, counts_read);
+    for(uint i = counts_read; i < counte_read; i++) {
+        u[i] = (tmp * x[i*t]) % P;
+        tmp = (tmp * twiddle) % P;
+    }
+
+    __syncthreads();
+
+    u = u_g + offset;
+
+    // if (threadIdx.x == 0) {
+    //     for (int i  = 0; i < blockDim.x *2; i++) {
+    //         printf("%lld ", u_g[i]);
+    //     }
+    //     printf("\n");
+    // }
+
+    const uint pqshift = max_deg - deg;
+    for(uint rnd = 0; rnd < deg; rnd++) {
+      const uint bit = counth >> rnd;
+      for(uint i = counts >> 1; i < counte >> 1; i++) {
+        const uint di = i & (bit - 1);
+        const uint i0 = (i << 1) - di;
+        const uint i1 = i0 + bit;
+        tmp = u[i0];
+        u[i0] = (u[i0] + u[i1]) % P;
+        u[i1] = (tmp + P - u[i1]) % P;
+        if(di != 0) u[i1] = (pq[di << rnd << pqshift] * u[i1]) % P;
+      }
+
+      __syncthreads();
+    }
+    
+
+    for(uint i = counts >> 1; i < counte >> 1; i++) {
+        y[i*p] = u[__brev(i) >> (32 - deg)];
+        y[(i+counth)*p] = u[__brev(i + counth) >> (32 - deg)];
+    }
+}
+
+long long * improved_NTT_v1(long long *x, long long *y,long long omega, uint log_n, uint log_g) {
 
     cudaEvent_t start, end;
     cudaEventCreate(&start);
@@ -558,14 +647,10 @@ long long * improved_NTT(long long *x, long long *y,long long omega, uint log_n,
 
 
     uint n = 1 << log_n;
-    uint g_num = 1 << log_g;
+    uint max_group_num = 1 << log_g;
 
     omega = qpow(omega, (P - 1ll) / n);
-    // All usages are safe as the buffers are initialized from either the host or the GPU
-    // before they are read.
-    // let mut src_buffer = unsafe { program.create_buffer::<F>(n)? };
-    // let mut dst_buffer = unsafe { program.create_buffer::<F>(n)? };
-    // The precalculated values pq` and `omegas` are valid for radix degrees up to `max_deg`
+
     uint max_deg = std::min(MAX_LOG2_RADIX - log_g, log_n);
 
     // Precalculate:
@@ -607,12 +692,13 @@ long long * improved_NTT(long long *x, long long *y,long long omega, uint log_n,
 
         // 1=>radix2, 2=>radix4, 3=>radix8, ...
         uint deg = std::min(max_deg, log_n - log_p);
+        uint g_num = std::min(n / (1 << deg), max_group_num);
 
         uint n = 1u << log_n;
         dim3 block((1 << (deg - 1)) * g_num );
         uint grid((n >> deg) / g_num);
 
-        improved_GZKP_bellperson <<< grid, block, sizeof(long long) * (1 << deg) * g_num >>>(x, y, pq_d, omegas_d, n, log_p, deg, max_deg, (1 << (deg - 1)));
+        improve_grouped <<< grid, block, sizeof(long long) * (1 << deg) * g_num >>>(x, y, pq_d, omegas_d, n, log_p, deg, max_deg, (1 << (deg - 1)));
 
         log_p += deg;
         long long * tmp = x;
@@ -629,7 +715,93 @@ long long * improved_NTT(long long *x, long long *y,long long omega, uint log_n,
     cudaEventElapsedTime(&t, start, end);
     delete [] res;
 
-    printf("improved: %fms\n", t);
+    printf("improved v1: %fms\n", t);
+    free(pq);
+    free(omegas);
+    cudaFree(pq_d);
+    cudaFree(omegas_d);
+    return x;
+}
+
+long long * improved_NTT_v2(long long *x, long long *y,long long omega, uint log_n, uint log_g) {
+
+    cudaEvent_t start, end;
+    cudaEventCreate(&start);
+    cudaEventCreate(&end);
+
+
+
+    uint n = 1 << log_n;
+    uint max_group_num = 1 << log_g;
+
+    omega = qpow(omega, (P - 1ll) / n);
+
+    uint max_deg = std::min(MAX_LOG2_RADIX - log_g, log_n);
+
+    // Precalculate:
+    // [omega^(0/(2^(deg-1))), omega^(1/(2^(deg-1))), ..., omega^((2^(deg-1)-1)/(2^(deg-1)))]
+    long long *pq, *pq_d;
+    long long *omegas, *omegas_d;
+    pq = new long long[1 << max_deg >> 1];
+    memset (pq, 0, sizeof(long long) * (1 << max_deg >> 1));
+    pq[0] = 1;
+    long long twiddle = qpow(omega, ((long long)n) >> (1ll*max_deg));
+    if (max_deg > 1) {
+        pq[1] = twiddle;
+        for (uint i = 2; i < (1 << max_deg >> 1) ; i++ ) {
+            pq[i] = pq[i - 1];
+            pq[i] = pq[i] *(twiddle)%P;
+        }
+    }
+    cudaMalloc(&pq_d, sizeof(long long) * (1 << max_deg >> 1));
+    cudaMemcpy(pq_d, pq, sizeof(long long) * (1 << max_deg >> 1), cudaMemcpyHostToDevice);
+
+    // Precalculate [omega, omega^2, omega^4, omega^8, ..., omega^(2^31)]
+    omegas = new long long[32];
+    memset (omegas, 0, sizeof(long long) * 32);
+    omegas[0] = omega;
+    for (uint i  = 1; i < 32; i++) {
+        omegas[i] = omegas[i - 1] * omegas[i - 1] % P;
+    }
+    cudaMalloc(&omegas_d, sizeof(long long) * 32);
+    cudaMemcpy(omegas_d, omegas, sizeof(long long) * 32, cudaMemcpyHostToDevice);
+    long long *res = new long long[n];
+
+    // Specifies log2 of `p`, (http://www.bealto.com/gpu-fft_group-1.html)
+    uint log_p = 0u;
+    
+    cudaEventRecord(start);
+
+    // Each iteration performs a FFT round
+    while (log_p < log_n) {
+
+        // 1=>radix2, 2=>radix4, 3=>radix8, ...
+        uint deg = std::min(max_deg, log_n - log_p);
+        uint g_num = std::min(n / (1 << deg), max_group_num);
+
+
+        uint n = 1u << log_n;
+        dim3 block((1 << (deg - 1)) * g_num );
+        uint grid((n >> deg) / g_num);
+
+        improve_group_coalesced_read <<< grid, block, sizeof(long long) * (1 << deg) * g_num >>>(x, y, pq_d, omegas_d, n, log_p, deg, max_deg, (1 << (deg - 1)));
+
+        log_p += deg;
+        long long * tmp = x;
+        x = y;
+        y = tmp;
+        // cudaMemcpy(res, x, sizeof(*res) * n, cudaMemcpyDeviceToHost);
+        // for (int i = 0; i < n; i++) printf("%lld ", res[i]);
+        // printf("\n");
+    }
+    cudaEventRecord(end);
+    cudaEventSynchronize(end);
+
+    float t;
+    cudaEventElapsedTime(&t, start, end);
+    delete [] res;
+
+    printf("improved v2: %fms\n", t);
     free(pq);
     free(omegas);
     cudaFree(pq_d);
@@ -749,9 +921,19 @@ int main() {
         }
     }
 
-    // improved
+    // improved v1
     cudaMemcpy(data_d, data_copy, length * sizeof(*data_d), cudaMemcpyHostToDevice);
-    res = improved_NTT(data_d, data_p, root, bits, 5);
+    res = improved_NTT_v1(data_d, data_p, root, bits, 5);
+    cudaMemcpy(tmp, res, sizeof(*res) * length, cudaMemcpyDeviceToHost);
+    for (long long i = 0; i < length; i++) {
+        if (data[i] != tmp[i]) {
+            printf("%lld %lld %lld\n", data[i], tmp[i], i);
+        }
+    }
+
+    // improved v2
+    cudaMemcpy(data_d, data_copy, length * sizeof(*data_d), cudaMemcpyHostToDevice);
+    res = improved_NTT_v2(data_d, data_p, root, bits, 5);
     cudaMemcpy(tmp, res, sizeof(*res) * length, cudaMemcpyDeviceToHost);
     for (long long i = 0; i < length; i++) {
         if (data[i] != tmp[i]) {
