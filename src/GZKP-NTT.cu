@@ -385,6 +385,84 @@ __global__ void FIELD_radix_fft(long long * x, // Source buffer
     }
 }
 
+/*
+ * FFT algorithm is inspired from: http://www.bealto.com/gpu-fft_group-1.html
+ */
+__global__ void FIELD_radix_fft_revised(long long * x, // Source buffer
+                      long long * y, // Destination buffer
+                      long long * pq, // Precalculated twiddle factors
+                      long long * omegas, // [omega, omega^2, omega^4, ...]
+                      uint n, // Number of elements
+                      uint lgp, // Log2 of `p` (Read more in the link above)
+                      uint deg, // 1=>radix2, 2=>radix4, 3=>radix8, ...
+                      uint max_deg) // Maximum degree supported, according to `pq` and `omegas`
+{
+// CUDA doesn't support local buffers ("shared memory" in CUDA lingo) as function arguments,
+// ignore that argument and use the globally defined extern memory instead.
+
+    // There can only be a single dynamic shared memory item, hence cast it to the type we need.
+    extern __shared__ long long u[];
+
+    uint lid = threadIdx.x;//GET_LOCAL_ID();
+    uint lsize = blockDim.x;//GET_LOCAL_SIZE();
+    uint index = blockIdx.x;//GET_GROUP_ID();
+    uint t = n >> deg;
+    uint p = 1 << lgp;
+    uint k = index & (p - 1);
+
+    x += index;
+    y += ((index - k) << deg) + k;
+
+    uint count = 1 << deg; // 2^deg
+    uint counth = count >> 1; // Half of count
+
+    uint counts = count / lsize * lid;
+    uint counte = counts + count / lsize;
+
+    // Compute powers of twiddle
+    const long long twiddle = FIELD_pow_lookup(omegas, (n >> lgp >> deg) * k);
+    long long tmp = FIELD_pow(twiddle, counts);
+    for(uint i = counts; i < counte; i++) {
+      u[__brev(i) >> (32 - deg)] = (tmp * x[i*t]) % P;
+      //printf("%lld %lld %u %u\n", x[i * t], u[__brev(i) >> (32 - deg)], i, lid);
+      tmp = (tmp * twiddle) % P;
+    }
+
+    __syncthreads();
+    // if (lid == 0) {
+    //     for (int i = 0; i < 16; i ++) printf("%lld ", u[i]);
+    //     printf("\n");
+    // }
+
+    const uint pqshift = max_deg - deg;
+    for(int rnd = deg - 1; rnd >= 0; rnd--) {
+      const uint bit = counth >> rnd;
+      for(uint i = counts >> 1; i < counte >> 1; i++) {
+        const uint di = i & (bit - 1);
+        const uint i0 = (i << 1) - di;
+        const uint i1 = i0 + bit;
+        tmp = u[i0];
+        if(di != 0) u[i1] = (pq[di << rnd << pqshift] % P * u[i1]) % P;
+
+        u[i0] = (u[i0] + u[i1]) % P;
+        //printf("%u %lld\n", di << rnd << pqshift, pq[di << rnd << pqshift]);
+        u[i1] = (tmp + P - u[i1]) % P;
+      }
+
+      __syncthreads();
+    //   if (lid == 0) {
+    //     for (int i = 0; i < 16; i ++) printf("%lld ", u[i]);
+    //     printf("\n");
+    // }
+    }
+    
+
+    for(uint i = counts >> 1; i < counte >> 1; i++) {
+        y[i*p] = u[i];
+        y[(i+counth)*p] = u[i+counth];
+    }
+}
+
 #define MAX_LOG2_RADIX 11u
 long long * bellperson_baseline(long long *x, long long *y,long long omega, uint log_n) {
 
@@ -446,9 +524,11 @@ long long * bellperson_baseline(long long *x, long long *y,long long omega, uint
 
         uint n = 1u << log_n;
         dim3 block(1 << std::min(deg - 1, 10u) );
-        uint grid(n >> deg);
+        dim3 grid(n >> deg);
 
-        FIELD_radix_fft <<< grid, block, sizeof(long long) * (1 << deg) >>>(x, y, pq_d, omegas_d, n, log_p, deg, max_deg);
+        printf("%d %d\n", block.x, grid.x);
+
+        FIELD_radix_fft_revised <<< grid, block, sizeof(long long) * (1 << deg) >>>(x, y, pq_d, omegas_d, n, log_p, deg, max_deg);
 
         log_p += deg;
         long long * tmp = x;
