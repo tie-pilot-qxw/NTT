@@ -8,9 +8,9 @@ origin = list(map(int, origin.split()))
 
 
 mod = 469762049
-omega = 426037461
+omega = 338628632
 
-for j in range(16):
-    for i in range(16):
+for j in range(256):
+    for i in range(256):
         if (origin[j] * omega**i)%mod == target[j]:
             print(i) 

@@ -113,7 +113,7 @@ void NTT_GPU_Naive(long long data[], longlong2 reverse[], long long len, long lo
 }
 
 __global__ void GZKP (long long data[],  int len, long long roots[], int stride, int G, int csize, int B) {
-    extern __shared__ long long s[];
+    extern __shared__ long long u[];
 
     int start = (G * blockIdx.x) % stride + ((int) G * blockIdx.x / stride) * stride * csize * 2;
 
@@ -130,8 +130,8 @@ __global__ void GZKP (long long data[],  int len, long long roots[], int stride,
     // load to shared memory
     if (gpos + stride >= len) return;
 
-    s[spos] = data[gpos];
-    s[spos + 1] = data[gpos + stride];
+    u[spos] = data[gpos];
+    u[spos + 1] = data[gpos + stride];
     __syncthreads();
     
     int cid = threadIdx.x % csize; // id of the compute group
@@ -153,15 +153,15 @@ __global__ void GZKP (long long data[],  int len, long long roots[], int stride,
 
         long long w = roots[tmp];
 
-        long long a = s[base + offset], b = w * s[base + offset + step] % P;
-        s[base + offset] = (a + b) % P;
-        s[base + offset + step] = (a - b + P) % P;
+        long long a = u[base + offset], b = w * u[base + offset + step] % P;
+        u[base + offset] = (a + b) % P;
+        u[base + offset + step] = (a - b + P) % P;
 
     }
     
     __syncthreads();
-    data[gpos] = s[spos];
-    data[gpos + stride] = s[spos + 1];
+    data[gpos] = u[spos];
+    data[gpos + stride] = u[spos + 1];
 }
 
 void NTT_GZKP(long long data[], longlong2 reverse[], long long len, long long omega, int B, int G, long long reverse_num) {

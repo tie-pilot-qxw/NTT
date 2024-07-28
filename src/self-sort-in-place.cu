@@ -97,9 +97,13 @@ void NTT_pro2(long long data[], uint log_len, long long omega) {
     uint len = 1 << log_len;
 
     for (uint i = log_len / 2; i >= 1; i--) {
+        // for (int j = 0; j < len; j++) {
+        //     printf("%lld ", data[j]);
+        // }
+        // printf("\n");
+
         uint stride = 1 << (i - 1);
         uint pair_stride = 1 << (log_len - i);
-        printf("%u %u\n", stride, pair_stride);
         long long gap = qpow(omega, (P - 1ll) / (stride << 1));
         for (uint start = 0; start < len; start += (pair_stride << 1)) {
             for (uint offset0 = 0; offset0 < pair_stride; offset0 += (stride << 1)) {
@@ -116,6 +120,10 @@ void NTT_pro2(long long data[], uint log_len, long long omega) {
             }
         }
     }
+    // for (int i = 0; i < len; i++) {
+    //         printf("%lld ", data[i]);
+    //     }
+    //     printf("\n");
 
 }
 
@@ -152,20 +160,16 @@ __global__ void SSIP_NTT_stage1 (long long * x, // Source buffer
 {
     extern __shared__ long long u[];
 
-    uint lid = threadIdx.x;
-    uint index = blockIdx.x;
-    const uint end_stride = 1 << log_stride >> (deg - 1); //stride of the last butterfly
-    // printf("%u %u", log_stride, end_stride);
+    const uint lid = threadIdx.x;
+    const uint index = blockIdx.x;
+    const uint lgp = log_stride - deg + 1;
+    const uint end_stride = 1 << lgp; //stride of the last butterfly
 
     // each segment is independent
-    uint segment_stride = end_stride << deg; // the distance between two segment
-    uint segment_num = end_stride; // # of blocks in a segment
     
-    uint segment_start = index / segment_num * segment_stride;
-    uint segment_id = index & (segment_num - 1);
+    uint segment_start = (index >> lgp) << (lgp + deg);
+    uint segment_id = index & (end_stride - 1);
     
-    // uint block_offset = segment_id; // TODO
-
     uint subblock_sz = 1 << (deg - 1); // # of neighbouring butterfly in the last round
     uint subblock_id = segment_id & (end_stride - 1);
 
@@ -173,27 +177,19 @@ __global__ void SSIP_NTT_stage1 (long long * x, // Source buffer
 
     uint group_id = lid & (subblock_sz - 1);
 
-    uint gpos = group_id * (end_stride << 1);
-
-    //printf("%u %u %u %u %u %u\n", blockIdx.x, threadIdx.x, gpos, group_id, segment_start, subblock_id);
+    uint gpos = group_id << (lgp + 1);
     
 
     u[(lid << 1)] = x[gpos];
     u[(lid << 1) + 1] = x[gpos + end_stride];
 
-     __syncthreads();
-    // if (threadIdx.x == 0 && blockIdx.x == 3) {
-    //         for (int i = 0; i < blockDim.x << 1; i++) {
-    //             printf("%lld ", u[i]);
-    //         }
-    //         printf("\n");
-    // }
+    __syncthreads();
+
     const uint pqshift = max_deg - deg;
     for(uint rnd = 0; rnd < deg; rnd++) {
         const uint bit = subblock_sz >> rnd;
-        uint i = lid;
-        const uint di = i & (bit - 1);
-        const uint i0 = (i << 1) - di;
+        const uint di = lid & (bit - 1);
+        const uint i0 = (lid << 1) - di;
         const uint i1 = i0 + bit;
         long long tmp = u[i0];
         u[i0] = (u[i0] + u[i1]) % P;
@@ -201,100 +197,121 @@ __global__ void SSIP_NTT_stage1 (long long * x, // Source buffer
         if(di != 0) u[i1] = (pq[di << rnd << pqshift] * u[i1]) % P;
 
         __syncthreads();
-
-        // if (threadIdx.x == 0 && blockIdx.x == 1) {
-        //     for (int i = 0; i < blockDim.x << 1; i++) {
-        //         printf("%lld ", u[i]);
-        //     }
-        //     printf("\n");
-        // }
     }
 
-
-    // if (threadIdx.x == 0 && blockIdx.x == 0) {
-    //     for (int i = 0; i < blockDim.x * 4; i++) {
-    //         printf("%lld ", s[i]);
-    //     }
-    // }
+    // Twiddle factor
     uint k = index & (end_stride - 1);
     long long twiddle = FIELD_pow_lookup(omegas, (n >> (log_stride - deg + 1) >> deg) * k);
 
-    //printf("%u %u %u %u %u %u\n", blockIdx.x, threadIdx.x, (n >> log_stride >> (deg - 1)) * k,lid << 1, __brev(lid << 1) >> (32 - deg),__brev((lid << 1) + 1) >> (32 - deg));
-
     long long t1 = FIELD_pow(twiddle, __brev(lid << 1) >> (32 - deg));
     long long t2 = FIELD_pow(twiddle, __brev((lid << 1) + 1) >> (32 - deg));
+
+    // printf("%u %u\n" ,(n >> (log_stride - deg + 1) >> deg) * k * (__brev(lid << 1) >> (32 - deg)), segment_start + subblock_id+gpos);
+    // printf("%u %u\n" ,(n >> (log_stride - deg + 1) >> deg) * k * (__brev((lid << 1) + 1) >> (32 - deg)), segment_start + subblock_id+gpos + end_stride);
     x[gpos] = t1 * u[(lid << 1)] % P;
     x[gpos + end_stride] = t2 * u[(lid << 1) + 1] % P;
 }
 
-// __global__ void SSIP_NTT_stage2 (long long data[], uint log_len, uint log_stride, uint deg) {
-//     extern __shared__ long long s[];
+__global__ void SSIP_NTT_stage2 (long long * data, // Source buffer
+                        long long * pq, // Precalculated twiddle factors
+                        long long * omegas, // [omega, omega^2, omega^4, ...]
+                        uint log_len, // Number of elements
+                        uint log_stride, // Log2 of `p` (Read more in the link above)
+                        uint deg, // 1=>radix2, 2=>radix4, 3=>radix8, ...
+                        uint max_deg) {
+    extern __shared__ long long u[];
 
-//     uint lid = threadIdx.x;
-//     uint index = blockIdx.x;
-//     uint start_stride = 1 << log_stride; // stride of the first butterfly
-//     uint end_stride = start_stride >> (deg - 1); //stride of the last butterfly
-//     uint start_pair_stride = 1 << (log_len - log_stride - 1); // the stride between the first pair of butterfly
-//     uint end_pair_stride = start_pair_stride << (deg - 1); // the stride between the last pair of butterfly
+    uint lid = threadIdx.x;
+    uint index = blockIdx.x;
+    uint end_stride = 1 << (log_stride - deg + 1); //stride of the last butterfly
+    uint start_pair_stride = 1 << (log_len - log_stride - 1); // the stride between the first pair of butterfly
+    uint end_pair_stride = start_pair_stride << (deg - 1); // the stride between the last pair of butterfly
 
-//     // each segment is independent
-//     uint segment_stride = end_pair_stride << 1; // the distance between two segment
-//     uint segment_num = segment_stride >> (deg << 1); // # of blocks in a segment
+    // each segment is independent
+    uint segment_stride = end_pair_stride << 1; // the distance between two segment
+    uint segment_num = segment_stride >> (deg << 1); // # of blocks in a segment
     
-//     uint segment_start = index / segment_num * segment_stride;
-//     uint segment_id = index & (segment_num - 1);
+    uint segment_start = index / segment_num * segment_stride;
+    uint segment_id = index & (segment_num - 1);
     
-//     // uint block_offset = segment_id; // TODO
+    uint subblock_sz = 1 << (deg - 1); // # of neighbouring butterfly in the last round
+    uint subblock_offset = (segment_id / (end_stride)) * (2 *subblock_sz * end_stride);
+    uint subblock_id = segment_id & (end_stride - 1);
 
-//     uint subblock_sz = 1 << (deg - 1); // # of neighbouring butterfly in the last round
-//     uint subblock_offset = (segment_id / (end_stride)) * (2 *subblock_sz * end_stride);
-//     uint subblock_id = segment_id & (end_stride - 1);
+    data += segment_start + subblock_offset + subblock_id;
 
-//     data += segment_start + subblock_offset + subblock_id;
+    uint group_offset = (lid / subblock_sz) * (start_pair_stride);
 
-//     uint group_offset = (lid / subblock_sz) * (start_pair_stride);
+    uint group_id = lid & (subblock_sz - 1);
 
-//     uint group_id = lid & (subblock_sz - 1);
+    uint gpos = group_offset + group_id * (end_stride << 1);
 
-//     uint gpos = group_offset + group_id * (end_stride << 1);
+    u[(lid << 1)] = data[gpos];
+    u[(lid << 1) + 1] = data[gpos + end_stride];
+    u[(lid << 1) + (blockDim.x << 1)] = data[gpos + end_pair_stride];
+    u[(lid << 1) + (blockDim.x << 1) + 1] = data[gpos + end_pair_stride + end_stride];
 
-//     printf("%u %u %u %u %u %u %u %u\n", blockIdx.x, threadIdx.x, gpos, group_offset, group_id, segment_start, subblock_offset, subblock_id);
+    __syncthreads();
 
-//     s[(lid << 1)] = data[gpos];
-//     s[(lid << 1) + 1] = data[gpos + end_stride];
-//     s[(lid << 1) + (blockDim.x << 1)] = data[gpos + end_pair_stride];
-//     s[(lid << 1) + (blockDim.x << 1) + 1] = data[gpos + end_pair_stride + end_stride];
+    const uint pqshift = max_deg - deg;
+    for(uint rnd = 0; rnd < deg; rnd++) {
+       
+        const uint bit = subblock_sz >> rnd;
+        const uint gap = (blockDim.x << 1) >> (deg - rnd - 1);
+        const uint offset = (gap) * (lid / (gap >> 1));
 
-//     if (threadIdx.x == 0 && blockIdx.x == 0) {
-//         for (int i = 0; i < blockDim.x * 4; i++) {
-//             printf("%lld ", s[i]);
-//         }
-//     }
-// }
+        const uint di = lid & (bit - 1);
+        const uint i0 = (lid << 1) - di + offset;
+        const uint i1 = i0 + bit;
+        const uint i2 = i0 + gap;
+        const uint i3 = i0 + gap + bit;
+        long long a, b, c, d;
+        a = u[i0], b = u[i1], c = u[i2], d = u[i3];
 
-void run_kernel(long long * data, uint log_len) {
-    uint deg = 3;
-    uint log_stride = 4;
+        u[i0] = (a + b) % P;
+        u[i2] = (c + d) % P;
+
+        u[i1] = ((a - b + P) % P);
+        if(di != 0) u[i1] = (pq[di << rnd << pqshift] * u[i1]) % P;
+
+        u[i3] = ((c - d + P) % P);
+        if(di != 0) u[i3] = (pq[di << rnd << pqshift] * u[i3]) % P;
+
+        __syncthreads();
+    }
+
+    // Twiddle factor
+    uint k = index & (end_stride - 1);
     uint n = 1 << log_len;
+    long long twiddle = FIELD_pow_lookup(omegas, (n >> (log_stride - deg + 1) >> deg) * k);
+    // if (threadIdx.x == 0);
+    // printf("%d %d\n",blockIdx.x, (n >> (log_stride - deg + 1) >> deg) * k);
 
-    dim3 block(1 << deg >> 1);
-    dim3 grid(n / 2 / block.x);
-    printf("%d %d\n", block.x, grid.x);
+    long long t1 = FIELD_pow(twiddle, lid << 1 >> deg);
+    long long t2 = FIELD_pow(twiddle, ((lid << 1) + (blockDim.x <<1)) >> deg);
+    // data[gpos] = u[(lid << 1)] * t1 % P;
+    // data[gpos + end_pair_stride] = u[(lid << 1) + (blockDim.x << 1)] * t1 % P;
+    // t1 = t1 * twiddle % P;
+    // data[gpos + end_stride] = u[(lid << 1) + 1] * t1 % P;
+    // data[gpos + end_pair_stride + end_stride] = u[(lid << 1) + (blockDim.x << 1) + 1] * t1 % P;
 
-    SSIP_NTT_stage1 <<< grid, block, sizeof(long long) * block.x * 2>>>(data, data, data, n, log_stride, deg, 0);
+    uint a, b, c, d;
+    a = __brev(lid << 1) >> (32 - (deg << 1));
+    b = __brev((lid << 1) + 1) >> (32 - (deg << 1));
+    c = __brev((lid << 1) + (blockDim.x << 1)) >> (32 - (deg << 1));
+    d = __brev((lid << 1) + (blockDim.x << 1) + 1) >> (32 - (deg << 1));
+    //printf("%u %u %u %u\n", a, b, c, d);
 
-
-    dim3 block1(1 << (deg << 1) >> 2);
-    dim3 grid1(n / 4 / block1.x);
-    printf("%d %d\n", block1.x, grid1.x);
-
-    // SSIP_NTT_stage2<<< grid1, block1, sizeof(long long) * block1.x * 4 >>>(data, log_len, log_stride, deg);
-
-    cudaDeviceSynchronize();
+    data[gpos] = u[a] * t1 % P;
+    data[gpos + end_stride] = u[b] * t1 % P;
+    data[gpos + end_pair_stride] = u[c] * t2 % P;
+    data[gpos + end_pair_stride + end_stride] = u[d] * t2 % P;
+    
 }
 
 #define MAX_LOG2_RADIX 11u
-void bellperson_baseline(long long *x,long long omega, uint log_n) {
+#define MAX_STAGE2_RADIX 6u
+void SSIP(long long *x,long long omega, uint log_n) {
 
     cudaEvent_t start, end;
     cudaEventCreate(&start);
@@ -305,6 +322,8 @@ void bellperson_baseline(long long *x,long long omega, uint log_n) {
     uint n = 1 << log_n;
 
     omega = qpow(omega, (P - 1ll) / n);
+
+    printf("%lld\n", omega);
     // for (uint i = 0; i <= n; i++) printf("%lld ", qpow(omega, i));
     // return;
     // All usages are safe as the buffers are initialized from either the host or the GPU
@@ -349,18 +368,37 @@ void bellperson_baseline(long long *x,long long omega, uint log_n) {
     cudaEventRecord(start);
 
     // Each iteration performs a FFT round
-    while (log_p >= 0) {
+    while (log_p >= log_n / 2) {
 
         // 1=>radix2, 2=>radix4, 3=>radix8, ...
-        uint deg = std::min(max_deg, log_p + 1);
+        uint deg = std::min(max_deg, (int)(log_p + 1 - log_n / 2));
 
         uint n = 1u << log_n;
-        dim3 block(1 << std::min(deg - 1, 10u) );
+        dim3 block(1 << (deg - 1) );
         dim3 grid(n >> deg);
 
         // printf("%d %d %d\n", block.x, grid.x, deg);
 
         SSIP_NTT_stage1 <<< grid, block, sizeof(long long) * (1 << deg) >>>(x, pq_d, omegas_d, n, log_p, deg, max_deg);
+
+        log_p -= deg;
+        // cudaMemcpy(res, x, sizeof(*res) * n, cudaMemcpyDeviceToHost);
+        // for (int i = 0; i < n; i++) printf("%lld ", res[i]);
+        // printf("\n");
+    }
+    assert (log_p == log_n / 2 - 1);
+    int max_deg2 = std::min(max_deg, (int)MAX_STAGE2_RADIX);
+    while (log_p >= 0) {
+        // 1=>radix2, 2=>radix4, 3=>radix8, ...
+        uint deg = std::min(max_deg2, log_p + 1);
+
+        uint n = 1u << log_n;
+        dim3 block1(1 << (deg << 1) >> 2);
+        dim3 grid1(n / 4 / block1.x);
+
+        // printf("%d %d %d\n", block1.x, grid1.x, deg);
+
+        SSIP_NTT_stage2 <<< grid1, block1, sizeof(long long) * (1 << (deg << 1)) >>>(x, pq_d, omegas_d, log_n, log_p, deg, max_deg);
 
         log_p -= deg;
         // cudaMemcpy(res, x, sizeof(*res) * n, cudaMemcpyDeviceToHost);
@@ -374,7 +412,7 @@ void bellperson_baseline(long long *x,long long omega, uint log_n) {
     cudaEventElapsedTime(&t, start, end);
     delete [] res;
 
-    printf("bellman: %fms\n", t);
+    printf("SSIP: %fms\n", t);
     free(pq);
     free(omegas);
     cudaFree(pq_d);
@@ -430,9 +468,9 @@ int main() {
     {
         clock_t start = clock();
 
-        // NTT_pro1(data_new, bits, root);
-        // NTT_pro2(data_new, bits, root);
-        NTT_dif(data_new, reverse, bits, root);
+        NTT_pro1(data_new, bits, root);
+        NTT_pro2(data_new, bits, root);
+        // NTT_dif(data_new, reverse, bits, root);
 
         clock_t end = clock();
         printf("cpu: %lfms\n",(double)(end - start) / CLOCKS_PER_SEC * 1000);
@@ -450,13 +488,9 @@ int main() {
     cudaMalloc(&data_d, sizeof(long long) * length);
     cudaMemcpy(data_d, data_copy, sizeof(long long) * length, cudaMemcpyHostToDevice);
 
-    bellperson_baseline(data_d, root, bits);
+    SSIP(data_d, root, bits);
 
     cudaMemcpy(data_new, data_d, length * sizeof(long long), cudaMemcpyDeviceToHost);
-    // rearrange the coefficients
-    for (long long i = 0; i < length; i++) {
-        if (i < reverse[i]) swap(data_new[i], data_new[reverse[i]]);
-    }
 
     for (long long i = 0; i < length; i++) {
         if (data_new[i] != data[i]) {
