@@ -223,28 +223,29 @@ __global__ void SSIP_NTT_stage2 (long long * data, // Source buffer
 
     uint lid = threadIdx.x;
     uint index = blockIdx.x;
-    uint end_stride = 1 << (log_stride - deg + 1); //stride of the last butterfly
-    uint start_pair_stride = 1 << (log_len - log_stride - 1); // the stride between the first pair of butterfly
-    uint end_pair_stride = start_pair_stride << (deg - 1); // the stride between the last pair of butterfly
+    uint log_end_stride = (log_stride - deg + 1);
+    uint end_stride = 1 << log_end_stride; //stride of the last butterfly
+    uint end_pair_stride = 1 << (log_len - log_stride - 2 + deg); // the stride between the last pair of butterfly
 
     // each segment is independent
-    uint segment_stride = end_pair_stride << 1; // the distance between two segment
-    uint segment_num = segment_stride >> (deg << 1); // # of blocks in a segment
+    // uint segment_stride = end_pair_stride << 1; // the distance between two segment
+    uint log_segment_num = (log_len - log_stride - 1 - deg); // log of # of blocks in a segment
     
-    uint segment_start = index / segment_num * segment_stride;
-    uint segment_id = index & (segment_num - 1);
+    uint segment_start = (index >> log_segment_num) << (log_segment_num + (deg << 1)); // segment_start = index / segment_num * segment_stride;
+
+    uint segment_id = index & ((1 << log_segment_num) - 1); // segment_id = index & (segment_num - 1);
     
     uint subblock_sz = 1 << (deg - 1); // # of neighbouring butterfly in the last round
-    uint subblock_offset = (segment_id / (end_stride)) * (2 *subblock_sz * end_stride);
+    uint subblock_offset = (segment_id >> log_end_stride) << (deg + log_end_stride); // subblock_offset = (segment_id / (end_stride)) * (2 * subblock_sz * end_stride);
     uint subblock_id = segment_id & (end_stride - 1);
 
     data += segment_start + subblock_offset + subblock_id;
 
-    uint group_offset = (lid / subblock_sz) * (start_pair_stride);
+    uint group_offset = (lid >> (deg - 1)) << (log_len - log_stride - 1);
 
     uint group_id = lid & (subblock_sz - 1);
 
-    uint gpos = group_offset + group_id * (end_stride << 1);
+    uint gpos = group_offset + (group_id << (log_end_stride + 1)); // group_offset + group_id * (end_stride << 1)
 
     u[(lid << 1)] = data[gpos];
     u[(lid << 1) + 1] = data[gpos + end_stride];
@@ -284,16 +285,10 @@ __global__ void SSIP_NTT_stage2 (long long * data, // Source buffer
     uint k = index & (end_stride - 1);
     uint n = 1 << log_len;
     long long twiddle = FIELD_pow_lookup(omegas, (n >> (log_stride - deg + 1) >> deg) * k);
-    // if (threadIdx.x == 0);
-    // printf("%d %d\n",blockIdx.x, (n >> (log_stride - deg + 1) >> deg) * k);
 
     long long t1 = FIELD_pow(twiddle, lid << 1 >> deg);
     long long t2 = FIELD_pow(twiddle, ((lid << 1) + (blockDim.x <<1)) >> deg);
-    // data[gpos] = u[(lid << 1)] * t1 % P;
-    // data[gpos + end_pair_stride] = u[(lid << 1) + (blockDim.x << 1)] * t1 % P;
-    // t1 = t1 * twiddle % P;
-    // data[gpos + end_stride] = u[(lid << 1) + 1] * t1 % P;
-    // data[gpos + end_pair_stride + end_stride] = u[(lid << 1) + (blockDim.x << 1) + 1] * t1 % P;
+
 
     uint a, b, c, d;
     a = __brev(lid << 1) >> (32 - (deg << 1));
@@ -309,7 +304,7 @@ __global__ void SSIP_NTT_stage2 (long long * data, // Source buffer
     
 }
 
-#define MAX_LOG2_RADIX 11u
+#define MAX_LOG2_RADIX 8u
 #define MAX_STAGE2_RADIX 6u
 void SSIP(long long *x,long long omega, uint log_n) {
 

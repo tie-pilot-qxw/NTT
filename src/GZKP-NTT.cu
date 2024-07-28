@@ -463,7 +463,7 @@ __global__ void FIELD_radix_fft_revised(long long * x, // Source buffer
     }
 }
 
-#define MAX_LOG2_RADIX 11u
+#define MAX_LOG2_RADIX 8u
 long long * bellperson_baseline(long long *x, long long *y,long long omega, uint log_n) {
 
     cudaEvent_t start, end;
@@ -526,7 +526,7 @@ long long * bellperson_baseline(long long *x, long long *y,long long omega, uint
         dim3 block(1 << std::min(deg - 1, 10u) );
         dim3 grid(n >> deg);
 
-        printf("%d %d\n", block.x, grid.x);
+        // printf("%d %d\n", block.x, grid.x);
 
         FIELD_radix_fft_revised <<< grid, block, sizeof(long long) * (1 << deg) >>>(x, y, pq_d, omegas_d, n, log_p, deg, max_deg);
 
@@ -1294,6 +1294,269 @@ long long * improved_NTT_v4(long long *x, long long *y,long long omega, uint log
     return x;
 }
 
+__global__ void SSIP_NTT_stage1 (long long * x, // Source buffer
+                        long long * pq, // Precalculated twiddle factors
+                        long long * omegas, // [omega, omega^2, omega^4, ...]
+                        uint n, // Number of elements
+                        uint log_stride, // Log2 of `p` (Read more in the link above)
+                        uint deg, // 1=>radix2, 2=>radix4, 3=>radix8, ...
+                        uint max_deg)
+{
+    extern __shared__ long long u[];
+
+    const uint lid = threadIdx.x;
+    const uint index = blockIdx.x;
+    const uint lgp = log_stride - deg + 1;
+    const uint end_stride = 1 << lgp; //stride of the last butterfly
+
+    // each segment is independent
+    
+    uint segment_start = (index >> lgp) << (lgp + deg);
+    uint segment_id = index & (end_stride - 1);
+    
+    uint subblock_sz = 1 << (deg - 1); // # of neighbouring butterfly in the last round
+    uint subblock_id = segment_id & (end_stride - 1);
+
+    x += segment_start + subblock_id;
+
+    uint group_id = lid & (subblock_sz - 1);
+
+    uint gpos = group_id << (lgp + 1);
+    
+
+    u[(lid << 1)] = x[gpos];
+    u[(lid << 1) + 1] = x[gpos + end_stride];
+
+    __syncthreads();
+
+    const uint pqshift = max_deg - deg;
+    for(uint rnd = 0; rnd < deg; rnd++) {
+        const uint bit = subblock_sz >> rnd;
+        const uint di = lid & (bit - 1);
+        const uint i0 = (lid << 1) - di;
+        const uint i1 = i0 + bit;
+        long long tmp = u[i0];
+        u[i0] = (u[i0] + u[i1]) % P;
+        u[i1] = (tmp + P - u[i1]) % P;
+        if(di != 0) u[i1] = (pq[di << rnd << pqshift] * u[i1]) % P;
+
+        __syncthreads();
+    }
+
+    // Twiddle factor
+    uint k = index & (end_stride - 1);
+    long long twiddle = FIELD_pow_lookup(omegas, (n >> (log_stride - deg + 1) >> deg) * k);
+
+    long long t1 = FIELD_pow(twiddle, __brev(lid << 1) >> (32 - deg));
+    long long t2 = FIELD_pow(twiddle, __brev((lid << 1) + 1) >> (32 - deg));
+
+    // printf("%u %u\n" ,(n >> (log_stride - deg + 1) >> deg) * k * (__brev(lid << 1) >> (32 - deg)), segment_start + subblock_id+gpos);
+    // printf("%u %u\n" ,(n >> (log_stride - deg + 1) >> deg) * k * (__brev((lid << 1) + 1) >> (32 - deg)), segment_start + subblock_id+gpos + end_stride);
+    x[gpos] = t1 * u[(lid << 1)] % P;
+    x[gpos + end_stride] = t2 * u[(lid << 1) + 1] % P;
+}
+
+__global__ void SSIP_NTT_stage2 (long long * data, // Source buffer
+                        long long * pq, // Precalculated twiddle factors
+                        long long * omegas, // [omega, omega^2, omega^4, ...]
+                        uint log_len, // Number of elements
+                        uint log_stride, // Log2 of `p` (Read more in the link above)
+                        uint deg, // 1=>radix2, 2=>radix4, 3=>radix8, ...
+                        uint max_deg) {
+    extern __shared__ long long u[];
+
+    uint lid = threadIdx.x;
+    uint index = blockIdx.x;
+    uint log_end_stride = (log_stride - deg + 1);
+    uint end_stride = 1 << log_end_stride; //stride of the last butterfly
+    uint end_pair_stride = 1 << (log_len - log_stride - 2 + deg); // the stride between the last pair of butterfly
+
+    // each segment is independent
+    // uint segment_stride = end_pair_stride << 1; // the distance between two segment
+    uint log_segment_num = (log_len - log_stride - 1 - deg); // log of # of blocks in a segment
+    
+    uint segment_start = (index >> log_segment_num) << (log_segment_num + (deg << 1)); // segment_start = index / segment_num * segment_stride;
+
+    uint segment_id = index & ((1 << log_segment_num) - 1); // segment_id = index & (segment_num - 1);
+    
+    uint subblock_sz = 1 << (deg - 1); // # of neighbouring butterfly in the last round
+    uint subblock_offset = (segment_id >> log_end_stride) << (deg + log_end_stride); // subblock_offset = (segment_id / (end_stride)) * (2 * subblock_sz * end_stride);
+    uint subblock_id = segment_id & (end_stride - 1);
+
+    data += segment_start + subblock_offset + subblock_id;
+
+    uint group_offset = (lid >> (deg - 1)) << (log_len - log_stride - 1);
+
+    uint group_id = lid & (subblock_sz - 1);
+
+    uint gpos = group_offset + (group_id << (log_end_stride + 1)); // group_offset + group_id * (end_stride << 1)
+
+    u[(lid << 1)] = data[gpos];
+    u[(lid << 1) + 1] = data[gpos + end_stride];
+    u[(lid << 1) + (blockDim.x << 1)] = data[gpos + end_pair_stride];
+    u[(lid << 1) + (blockDim.x << 1) + 1] = data[gpos + end_pair_stride + end_stride];
+
+    __syncthreads();
+
+    const uint pqshift = max_deg - deg;
+    for(uint rnd = 0; rnd < deg; rnd++) {
+       
+        const uint bit = subblock_sz >> rnd;
+        const uint gap = (blockDim.x << 1) >> (deg - rnd - 1);
+        const uint offset = (gap) * (lid / (gap >> 1));
+
+        const uint di = lid & (bit - 1);
+        const uint i0 = (lid << 1) - di + offset;
+        const uint i1 = i0 + bit;
+        const uint i2 = i0 + gap;
+        const uint i3 = i0 + gap + bit;
+        long long a, b, c, d;
+        a = u[i0], b = u[i1], c = u[i2], d = u[i3];
+
+        u[i0] = (a + b) % P;
+        u[i2] = (c + d) % P;
+
+        u[i1] = ((a - b + P) % P);
+        if(di != 0) u[i1] = (pq[di << rnd << pqshift] * u[i1]) % P;
+
+        u[i3] = ((c - d + P) % P);
+        if(di != 0) u[i3] = (pq[di << rnd << pqshift] * u[i3]) % P;
+
+        __syncthreads();
+    }
+
+    // Twiddle factor
+    uint k = index & (end_stride - 1);
+    uint n = 1 << log_len;
+    long long twiddle = FIELD_pow_lookup(omegas, (n >> (log_stride - deg + 1) >> deg) * k);
+
+    long long t1 = FIELD_pow(twiddle, lid << 1 >> deg);
+    long long t2 = FIELD_pow(twiddle, ((lid << 1) + (blockDim.x <<1)) >> deg);
+
+
+    uint a, b, c, d;
+    a = __brev(lid << 1) >> (32 - (deg << 1));
+    b = __brev((lid << 1) + 1) >> (32 - (deg << 1));
+    c = __brev((lid << 1) + (blockDim.x << 1)) >> (32 - (deg << 1));
+    d = __brev((lid << 1) + (blockDim.x << 1) + 1) >> (32 - (deg << 1));
+    //printf("%u %u %u %u\n", a, b, c, d);
+
+    data[gpos] = u[a] * t1 % P;
+    data[gpos + end_stride] = u[b] * t1 % P;
+    data[gpos + end_pair_stride] = u[c] * t2 % P;
+    data[gpos + end_pair_stride + end_stride] = u[d] * t2 % P;
+    
+}
+
+#define MAX_STAGE2_RADIX 6u
+void SSIP(long long *x,long long omega, uint log_n) {
+
+    cudaEvent_t start, end;
+    cudaEventCreate(&start);
+    cudaEventCreate(&end);
+
+
+
+    uint n = 1 << log_n;
+
+    omega = qpow(omega, (P - 1ll) / n);
+
+    // printf("%lld\n", omega);
+    // for (uint i = 0; i <= n; i++) printf("%lld ", qpow(omega, i));
+    // return;
+    // All usages are safe as the buffers are initialized from either the host or the GPU
+    // before they are read.
+    // let mut src_buffer = unsafe { program.create_buffer::<F>(n)? };
+    // let mut dst_buffer = unsafe { program.create_buffer::<F>(n)? };
+    // The precalculated values pq` and `omegas` are valid for radix degrees up to `max_deg`
+    int max_deg = std::min(MAX_LOG2_RADIX, log_n);
+
+    // Precalculate:
+    // [omega^(0/(2^(deg-1))), omega^(1/(2^(deg-1))), ..., omega^((2^(deg-1)-1)/(2^(deg-1)))]
+    long long *pq, *pq_d;
+    long long *omegas, *omegas_d;
+    pq = new long long[1 << max_deg >> 1];
+    memset (pq, 0, sizeof(long long) * (1 << max_deg >> 1));
+    pq[0] = 1;
+    long long twiddle = qpow(omega, ((long long)n) >> (1ll*max_deg));
+    if (max_deg > 1) {
+        pq[1] = twiddle;
+        for (uint i = 2; i < (1 << max_deg >> 1) ; i++ ) {
+            pq[i] = pq[i - 1];
+            pq[i] = pq[i] *(twiddle)%P;
+        }
+    }
+    cudaMalloc(&pq_d, sizeof(long long) * (1 << max_deg >> 1));
+    cudaMemcpy(pq_d, pq, sizeof(long long) * (1 << max_deg >> 1), cudaMemcpyHostToDevice);
+
+    // Precalculate [omega, omega^2, omega^4, omega^8, ..., omega^(2^31)]
+    omegas = new long long[32];
+    memset (omegas, 0, sizeof(long long) * 32);
+    omegas[0] = omega;
+    for (uint i  = 1; i < 32; i++) {
+        omegas[i] = omegas[i - 1] * omegas[i - 1] % P;
+    }
+    cudaMalloc(&omegas_d, sizeof(long long) * 32);
+    cudaMemcpy(omegas_d, omegas, sizeof(long long) * 32, cudaMemcpyHostToDevice);
+    long long *res = new long long[n];
+
+    // Specifies log2 of `p`, (http://www.bealto.com/gpu-fft_group-1.html)
+    int log_p = log_n - 1;
+    
+    cudaEventRecord(start);
+
+    // Each iteration performs a FFT round
+    while (log_p >= log_n / 2) {
+
+        // 1=>radix2, 2=>radix4, 3=>radix8, ...
+        uint deg = std::min(max_deg, (int)(log_p + 1 - log_n / 2));
+
+        uint n = 1u << log_n;
+        dim3 block(1 << (deg - 1) );
+        dim3 grid(n >> deg);
+
+        // printf("%d %d %d\n", block.x, grid.x, deg);
+
+        SSIP_NTT_stage1 <<< grid, block, sizeof(long long) * (1 << deg) >>>(x, pq_d, omegas_d, n, log_p, deg, max_deg);
+
+        log_p -= deg;
+        // cudaMemcpy(res, x, sizeof(*res) * n, cudaMemcpyDeviceToHost);
+        // for (int i = 0; i < n; i++) printf("%lld ", res[i]);
+        // printf("\n");
+    }
+    assert (log_p == log_n / 2 - 1);
+    int max_deg2 = std::min(max_deg, (int)MAX_STAGE2_RADIX);
+    while (log_p >= 0) {
+        // 1=>radix2, 2=>radix4, 3=>radix8, ...
+        uint deg = std::min(max_deg2, log_p + 1);
+
+        uint n = 1u << log_n;
+        dim3 block1(1 << (deg << 1) >> 2);
+        dim3 grid1(n / 4 / block1.x);
+
+        // printf("%d %d %d\n", block1.x, grid1.x, deg);
+
+        SSIP_NTT_stage2 <<< grid1, block1, sizeof(long long) * (1 << (deg << 1)) >>>(x, pq_d, omegas_d, log_n, log_p, deg, max_deg);
+
+        log_p -= deg;
+        // cudaMemcpy(res, x, sizeof(*res) * n, cudaMemcpyDeviceToHost);
+        // for (int i = 0; i < n; i++) printf("%lld ", res[i]);
+        // printf("\n");
+    }
+    cudaEventRecord(end);
+    cudaEventSynchronize(end);
+
+    float t;
+    cudaEventElapsedTime(&t, start, end);
+    delete [] res;
+
+    printf("SSIP: %fms\n", t);
+    free(pq);
+    free(omegas);
+    cudaFree(pq_d);
+    cudaFree(omegas_d);
+}
+
 int main() {
     long long *data, *reverse, *data_copy;
     long long l,length = 1ll;
@@ -1439,6 +1702,17 @@ int main() {
     // improved v4
     cudaMemcpy(data_d, data_copy, length * sizeof(*data_d), cudaMemcpyHostToDevice);
     res = improved_NTT_v4(data_d, data_p, root, bits, 5);
+    cudaMemcpy(tmp, res, sizeof(*res) * length, cudaMemcpyDeviceToHost);
+    for (long long i = 0; i < length; i++) {
+        if (data[i] != tmp[i]) {
+            printf("%lld %lld %lld\n", data[i], tmp[i], i);
+        }
+    }
+
+    // SSIP
+    cudaMemcpy(data_d, data_copy, length * sizeof(*data_d), cudaMemcpyHostToDevice);
+    SSIP(data_d, root, bits);
+    res = data_d;
     cudaMemcpy(tmp, res, sizeof(*res) * length, cudaMemcpyDeviceToHost);
     for (long long i = 0; i < length; i++) {
         if (data[i] != tmp[i]) {
